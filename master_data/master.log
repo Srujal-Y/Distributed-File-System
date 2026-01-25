@@ -1,0 +1,13 @@
+{"op": "register_node", "payload": {"node_id": "be01508f-babd-407f-a88c-39b7b76fd1e5", "host": "127.0.0.1", "port": 9100}}
+{"op": "register_node", "payload": {"node_id": "22c4d8d4-6f42-47da-8f6f-16427c20a0ef", "host": "127.0.0.1", "port": 9101}}
+{"op": "register_node", "payload": {"node_id": "185b2ec0-fe12-4842-ba8d-cdf85b53077b", "host": "127.0.0.1", "port": 9102}}
+{"op": "record_chunk", "payload": {"file_id": "e0a34786-33df-47d5-9110-13b6f7fc307b", "chunk_id": "a2538119-9340-4764-b09a-7b7386a1fcd4", "nodes": ["be01508f-babd-407f-a88c-39b7b76fd1e5", "22c4d8d4-6f42-47da-8f6f-16427c20a0ef", "185b2ec0-fe12-4842-ba8d-cdf85b53077b"]}}
+{"op": "register_node", "payload": {"node_id": "9f52d8d1-210e-440f-ba0d-1a8618ad868a", "host": "127.0.0.1", "port": 9100}}
+{"op": "register_node", "payload": {"node_id": "0c44a5f7-4f15-424d-bfce-abf9f0b9e5f4", "host": "127.0.0.1", "port": 9101}}
+{"op": "register_node", "payload": {"node_id": "d26540d3-7d00-42ca-b9e8-a9fbb816d4a9", "host": "127.0.0.1", "port": 9102}}
+{"op": "register_node", "payload": {"node_id": "e819cff4-678b-4334-9aa6-50e1ee7544ad", "host": "127.0.0.1", "port": 9100}}
+{"op": "register_node", "payload": {"node_id": "4e56f94a-17fd-46a2-af4a-ad3c3ceca09f", "host": "127.0.0.1", "port": 9101}}
+{"op": "register_node", "payload": {"node_id": "f3a32142-e5ad-498c-9d3d-ed0ff8e4d556", "host": "127.0.0.1", "port": 9102}}
+{"op": "register_node", "payload": {"node_id": "be9e684a-228e-4d4b-881e-d87542906d89", "host": "127.0.0.1", "port": 9100}}
+{"op": "register_node", "payload": {"node_id": "51261d8e-b629-4778-8ca9-ea7161423d91", "host": "127.0.0.1", "port": 9101}}
+{"op": "register_node", "payload": {"node_id": "769c3854-152a-4604-b09f-feec8711eac7", "host": "127.0.0.1", "port": 9102}}

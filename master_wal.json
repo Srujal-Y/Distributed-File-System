@@ -1,0 +1,534 @@
+{
+    "files": {
+        "8f4c719e-27bd-4043-b786-ab91b3332432": [
+            {
+                "chunk_id": "58b9a666-f92b-4349-8d48-b9ab130210b7",
+                "node_id": "94b61a6c-daba-44ad-ab5c-f9ae0929677c"
+            }
+        ],
+        "1ac37e50-98d8-4e54-be61-3d2831d41b67": [
+            {
+                "chunk_id": "5311ff35-3d96-4fa9-b6d0-88f008be8d10",
+                "node_id": "117f733e-a939-4893-b43a-56fb49ffbe4a"
+            }
+        ],
+        "5726928f-c8eb-4f3d-8c0e-652fe171820f": [
+            {
+                "chunk_id": "bd0d0418-06a6-4e98-b4c0-073d8e585687",
+                "node_id": "f6cb6b4f-0b6b-4eaf-bac6-4b877f6c908b"
+            }
+        ],
+        "27dbf765-9e76-4466-89b3-c3d7ac23bf05": [
+            {
+                "chunk_id": "3e195133-50ac-4efd-90fd-7000f01342a0",
+                "node_id": "6187d670-6276-4b8c-8c56-f7ed4b7313de"
+            },
+            {
+                "chunk_id": "b78b926e-e774-41d5-b87e-a3bb8ac483d3",
+                "node_id": "6187d670-6276-4b8c-8c56-f7ed4b7313de"
+            },
+            {
+                "chunk_id": "48725f22-24f2-4344-9ea4-52107f2f0595",
+                "node_id": "6187d670-6276-4b8c-8c56-f7ed4b7313de"
+            }
+        ],
+        "5de24654-6ffe-4d2f-b8e7-516aba3342b4": [
+            {
+                "chunk_id": "c8e727b5-24c3-4e79-97b3-4b175f6438ee",
+                "node_id": "f1904075-186e-484d-aa40-a6dfd5162c47"
+            },
+            {
+                "chunk_id": "74ff9b6e-f02e-4107-b2b1-e45612bcfdce",
+                "node_id": "f1904075-186e-484d-aa40-a6dfd5162c47"
+            },
+            {
+                "chunk_id": "cadef60b-ca83-44fc-867b-e946777ba18e",
+                "node_id": "f1904075-186e-484d-aa40-a6dfd5162c47"
+            }
+        ],
+        "a2965146-cd66-426c-b911-d7b89699ce68": [
+            {
+                "chunk_id": "d272768a-0ddd-4b13-895e-8e88c6636744",
+                "node_id": "d426ae40-0d46-4599-83d4-d7913271546b"
+            },
+            {
+                "chunk_id": "c9d02b4f-de55-4d69-b171-0f6bc895004c",
+                "node_id": "d426ae40-0d46-4599-83d4-d7913271546b"
+            },
+            {
+                "chunk_id": "7a84dcf1-129e-4e71-8686-653ce360f847",
+                "node_id": "d426ae40-0d46-4599-83d4-d7913271546b"
+            }
+        ],
+        "29f18592-0691-4c3d-8bc4-d10aa590c173": [
+            {
+                "chunk_id": "d8fc6d72-911a-47a2-97e8-6b8aa1a0c4b9",
+                "node_id": "41b84986-1232-43a6-9fe7-842d44bd9aa6"
+            },
+            {
+                "chunk_id": "243dfe23-9c45-44e5-af07-13222eff6f7a",
+                "node_id": "41b84986-1232-43a6-9fe7-842d44bd9aa6"
+            },
+            {
+                "chunk_id": "3bfab57b-cae5-4dbb-8869-295c3ca61b04",
+                "node_id": "41b84986-1232-43a6-9fe7-842d44bd9aa6"
+            }
+        ],
+        "db4b4dd1-8320-4a65-80a7-774285d76e81": [
+            {
+                "chunk_id": "e64fb6c8-d97f-4d25-948d-56ca69c05e23",
+                "node_id": "41b84986-1232-43a6-9fe7-842d44bd9aa6"
+            },
+            {
+                "chunk_id": "96df0fa0-29bc-4284-bf64-420869de38cd",
+                "node_id": "41b84986-1232-43a6-9fe7-842d44bd9aa6"
+            },
+            {
+                "chunk_id": "83cce693-8920-4b22-a106-0ff4f7890eb3",
+                "node_id": "41b84986-1232-43a6-9fe7-842d44bd9aa6"
+            }
+        ],
+        "8bc2d0ef-94f7-400e-8294-0c90b185e168": [
+            {
+                "chunk_id": "7dda373f-8f65-4865-be3a-4c0ebcb00923",
+                "node_id": "41b84986-1232-43a6-9fe7-842d44bd9aa6"
+            },
+            {
+                "chunk_id": "344d75e2-e066-4b29-9bb2-acc5a9f23b84",
+                "node_id": "41b84986-1232-43a6-9fe7-842d44bd9aa6"
+            },
+            {
+                "chunk_id": "1f66978d-00fd-4ce9-ba3b-06e042d48d00",
+                "node_id": "41b84986-1232-43a6-9fe7-842d44bd9aa6"
+            }
+        ],
+        "85ab7306-c054-4ad5-b833-e1b94f985518": [
+            {
+                "chunk_id": "1d539943-32c2-4c57-a375-cf5b77e5a86f",
+                "node_id": "41b84986-1232-43a6-9fe7-842d44bd9aa6"
+            },
+            {
+                "chunk_id": "37600fda-4e5d-4548-a719-dc8392cf2366",
+                "node_id": "41b84986-1232-43a6-9fe7-842d44bd9aa6"
+            },
+            {
+                "chunk_id": "59278631-ea7c-47ae-9762-1eccc4916482",
+                "node_id": "41b84986-1232-43a6-9fe7-842d44bd9aa6"
+            }
+        ],
+        "a61a8dc7-d0c9-44b5-bf74-de354e630953": [
+            {
+                "chunk_id": "f8c92f72-e17c-4ce6-8b63-7f6e207d77e5",
+                "node_id": "41b84986-1232-43a6-9fe7-842d44bd9aa6"
+            },
+            {
+                "chunk_id": "6f2ebc1c-df37-41c9-98d9-91cfb58e103b",
+                "node_id": "41b84986-1232-43a6-9fe7-842d44bd9aa6"
+            },
+            {
+                "chunk_id": "4e4a3eee-f39f-45f2-81fe-5613a73572d7",
+                "node_id": "41b84986-1232-43a6-9fe7-842d44bd9aa6"
+            }
+        ],
+        "e66d5bae-9f89-41f1-9605-cebe8b3db6ab": [
+            {
+                "chunk_id": "1de9bdae-cdfb-4234-bf7c-14923949c819",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            },
+            {
+                "chunk_id": "84316f8a-f067-4a67-98e9-563f1fc52dba",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            },
+            {
+                "chunk_id": "1eb82447-b54c-4c98-bde7-31baa12227f3",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            }
+        ],
+        "3fe9e74e-b458-4ad2-a2bc-a2f559768dce": [
+            {
+                "chunk_id": "0fc1bfa0-f3a3-437b-aefa-010137d09914",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            },
+            {
+                "chunk_id": "083b6521-b9ba-47a4-8c90-82dd686c05bc",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            },
+            {
+                "chunk_id": "781fce9c-6f7e-4024-9a1f-719f39da974d",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            }
+        ],
+        "3abe80e7-eb5c-4a73-8787-f2ce20cb99f9": [
+            {
+                "chunk_id": "46cb5d8a-7873-4948-b947-e6be69054d87",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            },
+            {
+                "chunk_id": "1cdad752-81aa-47d6-ad86-a2e8c391f755",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            },
+            {
+                "chunk_id": "c128fcce-f0e0-4e55-8ad3-7e2a5fcf9327",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            }
+        ],
+        "5010fbdc-11c6-45a9-8172-66f32a5a20ea": [
+            {
+                "chunk_id": "58466c3b-f691-4157-925f-7622c37cd2c7",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            },
+            {
+                "chunk_id": "639babcc-044c-4f69-983a-5dd6635b90c4",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            },
+            {
+                "chunk_id": "7a8154b6-6a8b-46d4-9b9e-64ac63fdf3ff",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            }
+        ],
+        "9ca1c7c7-0027-4a0c-8b4b-6a0bbb289cc1": [
+            {
+                "chunk_id": "5fb30e00-1efe-4c63-a7e8-659cc5013b18",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            },
+            {
+                "chunk_id": "f096949e-60b4-43f6-a86c-8320dd3a1afc",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            },
+            {
+                "chunk_id": "34fc0339-7d0d-4ba7-90cf-6bdc68c112ca",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            }
+        ],
+        "cdd14905-f5ae-4da5-9ea4-1d3dc0bf2a0d": [
+            {
+                "chunk_id": "0a92230f-ae9a-48e0-b246-a828163ba62c",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            },
+            {
+                "chunk_id": "9cda1d4b-cc5e-4204-b69f-203f65542d5a",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            },
+            {
+                "chunk_id": "125cb60f-5767-4802-9463-b7f8a41a6221",
+                "node_id": "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e"
+            }
+        ],
+        "d50e482f-9877-4000-ac5e-5963999faa39": [
+            {
+                "chunk_id": "7ee1d828-f4ed-40c8-a4e1-700584e0df20",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            },
+            {
+                "chunk_id": "d2bb0ed6-76ac-4490-a467-280ce2f4aac2",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            },
+            {
+                "chunk_id": "392eeee8-4d9d-42c6-9734-99691cdb658b",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            }
+        ],
+        "8634e862-c7e4-4c49-ac35-78c9e3ea27b5": [
+            {
+                "chunk_id": "257588c2-4b0d-4d3b-844d-0e470afee8a9",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            },
+            {
+                "chunk_id": "0b2f307e-8312-4adb-bd70-61dd7fcfe87d",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            },
+            {
+                "chunk_id": "77d8b94c-da3c-4c61-9e24-80a8ea7e728d",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            }
+        ],
+        "9c5bac1e-fe41-4bba-a9ae-ab9e32a39abe": [
+            {
+                "chunk_id": "849107e8-c6b0-4be3-9626-aecf4075e8ea",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            },
+            {
+                "chunk_id": "4e463289-323a-4f85-873b-4c9bee9e670f",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            },
+            {
+                "chunk_id": "7a8a4cb3-68d1-45fa-b82e-3acb4f0a225c",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            }
+        ],
+        "9b47b42e-cac6-4217-85f9-3612bf7b513c": [
+            {
+                "chunk_id": "65e771b3-6452-4f77-97bb-0cca61df268e",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            },
+            {
+                "chunk_id": "92e18e8f-f428-4705-b771-9057077b0270",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            },
+            {
+                "chunk_id": "4e9da41d-1c2a-408e-bc56-8dfdadb90ad7",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            }
+        ],
+        "28272254-97c5-42bc-add5-501b895363e9": [
+            {
+                "chunk_id": "4ebf5bcc-8a81-4266-b2e7-152693911a4d",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            },
+            {
+                "chunk_id": "db5be4d0-8d8b-4c37-a32c-0503bbf2edc2",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            },
+            {
+                "chunk_id": "daa1da4c-41fd-4005-98d5-f033bc928ae9",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            }
+        ],
+        "9d70e249-08b1-47b9-b944-cac207c1bed3": [
+            {
+                "chunk_id": "2423d832-369d-46db-8712-b662b232e169",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            },
+            {
+                "chunk_id": "d36d6967-7ddf-49af-9fae-b8dc03458370",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            },
+            {
+                "chunk_id": "02f994bf-ec91-4cd7-85ed-fd53159419a3",
+                "node_id": "df2ea9bc-925a-4bed-942b-b0810dc94552"
+            }
+        ],
+        "241275dc-f986-4f19-acd0-62e22d3e1ac3": [
+            {
+                "chunk_id": "0badf12f-7f43-4071-9732-776cd3b3bcb2",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            },
+            {
+                "chunk_id": "1ba6ea12-e39f-4aa9-b4c6-39528402c79a",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            },
+            {
+                "chunk_id": "e86b9faf-1e2d-4c6a-9e64-3ae585012493",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            }
+        ],
+        "44545eff-7ec9-4882-bbe3-4e57a0fdd755": [
+            {
+                "chunk_id": "4f0bf9c4-f707-4db6-86b0-b372557a6857",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            },
+            {
+                "chunk_id": "83ec304c-7921-4247-8997-c4113c01a39b",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            },
+            {
+                "chunk_id": "e8db90f2-1cd6-4b09-a4ef-ca505c5b2cfc",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            }
+        ],
+        "3f542502-6214-4082-8540-f4d73efc6e69": [
+            {
+                "chunk_id": "15c2fe27-2414-4b21-a2b9-0636d8434d7a",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            },
+            {
+                "chunk_id": "cb64e88c-7c80-464f-a206-1baec039d1e6",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            },
+            {
+                "chunk_id": "aae89d3b-3a98-49b1-867e-a168d9422b56",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            }
+        ],
+        "5e7a3502-6d5a-4c66-8c00-59a4902961e4": [
+            {
+                "chunk_id": "2dd7f9b1-0a98-4bff-8c15-71fc766b4789",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            },
+            {
+                "chunk_id": "98d99247-a205-4591-96e7-5266eb63cbb2",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            },
+            {
+                "chunk_id": "60949be4-1472-4513-a4c5-9bc3e2c414ac",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            }
+        ],
+        "5e3b302b-72c5-4aa9-9dfd-6b5f72278104": [
+            {
+                "chunk_id": "45bbfe39-8522-4f1b-ab0b-c9b2ceea01d9",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            },
+            {
+                "chunk_id": "71f495b1-266f-4b32-827e-621a17ed9ea4",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            },
+            {
+                "chunk_id": "b01efa4e-aa78-4657-9910-d2800106566a",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            }
+        ],
+        "6a5fa7e1-db3b-4cfc-b8c2-cf9b62ba08e0": [
+            {
+                "chunk_id": "74a910ad-58d2-494d-9998-dbf2001eecea",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            },
+            {
+                "chunk_id": "cc29c1c9-3478-4e4e-85c0-1562002cdbb4",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            },
+            {
+                "chunk_id": "d4917180-c961-4a20-a3f7-1c4176c3833e",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            }
+        ],
+        "1fbb278a-d4b9-4125-84f1-59d9fce75ba7": [
+            {
+                "chunk_id": "eb214ac3-9daf-440e-b96d-62701d54ff0d",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            },
+            {
+                "chunk_id": "4254826c-d07c-4260-871c-cc048322d65d",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            },
+            {
+                "chunk_id": "d755e938-d17f-4480-bea4-749768cda58e",
+                "node_id": "55966604-35ae-4663-8b5b-018152933aad"
+            }
+        ]
+    },
+    "datanodes": {
+        "94b61a6c-daba-44ad-ab5c-f9ae0929677c": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "117f733e-a939-4893-b43a-56fb49ffbe4a": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "f6cb6b4f-0b6b-4eaf-bac6-4b877f6c908b": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "6187d670-6276-4b8c-8c56-f7ed4b7313de": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "f1904075-186e-484d-aa40-a6dfd5162c47": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "d426ae40-0d46-4599-83d4-d7913271546b": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "41b84986-1232-43a6-9fe7-842d44bd9aa6": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "607f0744-faeb-4df7-8016-2275aa3be912": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "b319a69f-cafb-42fe-8a32-d381acb54127": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "5a6442aa-af82-4194-9b9b-10ce64c20181": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "74af91e2-8fbc-4d3e-bb02-075c7b4d48cb": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "fd66d356-862d-43e3-be6b-1720e47be753": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "bd83f3b2-494c-44a1-986e-5e64bb2260d4": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "d17d3912-db67-4ecf-aeda-4bf2bea675b1": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "ff33a2c4-3770-4e50-985b-ddb573738f8c": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "0a1f6bf1-0984-4a63-adf6-2f3e49f0273e": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "3514cc8e-1791-49c5-bca6-17b55b771f50": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "1b565265-fffd-4675-97bc-2f813e06c144": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "5904d2e0-d239-4a4a-b457-007592e3f456": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "91096898-d3fc-4f35-8838-028bb7c80106": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "407b3e30-0198-415f-aa62-6bf06057e45e": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "51ccfa73-c458-4aa7-8e0f-410d7159fbc5": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "aa1d5105-06f2-4189-ae85-a66ff933f3d8": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "df2ea9bc-925a-4bed-942b-b0810dc94552": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "505ed70a-6bfb-4826-8275-4bcf82435662": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "ee6def97-4508-42d9-835d-f0b650b49da4": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "c25b89c6-b203-4ace-a3dc-90455f5b8e0d": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "8a3272ca-27ea-4488-ab3f-efc3682403a4": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "55966604-35ae-4663-8b5b-018152933aad": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "cc006f49-9d61-4ce3-95e3-e53281a2ac2f": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "f21f9acb-1e2d-4b5d-8ff8-0e974e2298ac": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "d8823067-2261-4ebd-a27c-0da2fb9f6673": {
+            "host": "127.0.0.1",
+            "port": 9100
+        },
+        "cace1c22-44e6-42fc-ad04-644dbc10131b": {
+            "host": "127.0.0.1",
+            "port": 9100
+        }
+    }
+}

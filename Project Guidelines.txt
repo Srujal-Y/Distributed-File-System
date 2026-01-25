@@ -1,0 +1,137 @@
+# **DistriFS (Distributed File System)**
+
+Project Duration: 8 Weeks
+
+Goal: Build a fault-tolerant, distributed file system inspired by GFS (Google File System) and HDFS.
+
+Learning Outcome: Move beyond “API development” into “Systems Engineering.” You will manually implement concepts usually abstracted away by databases: sharding, replication, leader election, and durability.
+
+## **1. Executive Summary**
+
+DistriFS is a user-space distributed file system capable of storing files larger than the disk capacity of a single machine. It handles data chunking, replication across multiple nodes, and automatic recovery from node failures.
+
+While a typical web server relies on a database for state, DistriFS **is** the state store. This requires a fundamental shift in how you handle memory, disk I/O, and network consistency. You are not building a wrapper around S3; you are building the underlying storage engine itself.
+
+**Core Philosophy:** “Hardware fails, software must survive.”
+
+- **Assumption of Failure:** We assume hard drives will crash, networks will partition, and power cables will be pulled. The system must operate correctly despite these frequent failures.
+- **Consistency over Availability:** In the event of a network partition, DistriFS prefers to deny a write rather than acknowledge a write that cannot be safely replicated (CP system in CAP theorem terms).
+
+## **2. High-Level Architecture**
+
+The system follows a strict **Master-Slave (Leader-Follower)** architecture. This simplifies the consistency model compared to peer-to-peer systems (like DynamoDB or Cassandra) but introduces a single point of failure and a bottleneck, which we must manage carefully.
+
+### **A. The Master Node (Metadata Service)**
+
+- **Role:** The “Brain” and “Traffic Cop” of the system. It knows *where* data is, but never touches the data itself.
+- **Responsibilities:**
+    - **Namespace Management:** Maintains the file tree (directories, files) and permissions.
+    - **Chunk Mapping:** Stores the critical FileName -> [ChunkIDs] mapping.
+    - **Location Registry:** Stores the volatile mapping of ChunkID -> [DataNode Addresses].
+    - **System Health:** Actively monitors DataNodes via heartbeats and manages the replication queue for under-replicated chunks.
+- **Engineering Constraint (The “RAM Bottleneck”):**
+    - All metadata must be held **in-memory** for low-latency access. If the Master has to hit the disk to find where “movie.mp4” is, the system will be too slow.
+    - *Implication:* The capacity of the system is limited by the Master’s RAM. You must design efficient in-memory structures (e.g., Hash Maps or Radix Trees) to minimize the footprint per file.
+    - **Durability:** Since RAM is volatile, all mutations (CreateFile, DeleteFile) must be appended to a **Write-Ahead Log (WAL)** on disk *before* modifying the in-memory state. On reboot, the Master replays this log to restore its state.
+
+### **B. The DataNodes (Chunk Servers)**
+
+- **Role:** The “Muscle” of the system. These are dumb workers that follow instructions.
+- **Responsibilities:**
+    - **Blob Storage:** Store raw file chunks (fixed size, e.g., 64MB) on the local disk. They should not know what a “file” is, only what a “chunk” is.
+    - **I/O Operations:** Handle high-throughput read/write streams from Clients.
+    - **Lifeline:** Send periodic **Heartbeats** (every 3s) to the Master.
+    - **Block Reports:** Periodically (every 30s) scan their local disks and send a full list of all chunks they possess to the Master. This is how the Master rebuilds its Location Registry after a restart.
+    - **Pipeline Replication:** Forward data to other DataNodes during a write operation.
+
+### **C. The Client (CLI/SDK)**
+
+- **Role:** The intelligent driver.
+- **Responsibilities:**
+    - **Chunking Logic:** Splits a large file (e.g., 10GB) into 64MB chunks.
+    - **Metadata Caching:** Caches the location of chunks to reduce load on the Master.
+    - **Data Pipelining:** Connects directly to DataNodes for data transfer.
+    - **Failure Handling:** If a DataNode fails during a read/write, the Client must transparently retry with a different replica or ask the Master for a new plan.
+
+## **3. Technical Constraints & Stack**
+
+- **Language:** Go (Golang) or Rust.
+    - *Why:* These languages provide low-level control over memory layouts and concurrency primitives (Channels/Mutexes) essential for systems programming. Python/JS garbage collection pauses are unacceptable for high-throughput heartbeats.
+- **Communication Protocols:**
+    - **Control Plane (gRPC + Protobuf):** Strict schemas for low-volume, high-importance messages (Heartbeats, Metadata requests).
+    - **Data Plane (TCP Streams):** Raw TCP sockets for transferring file data. gRPC overhead is often too high for pushing gigabytes of binary data.
+- **Storage:** Local filesystem (/tmp/distrifs/data).
+    - Each chunk should be a standard Linux file named by its UUID (e.g., /tmp/distrifs/data/chunk-abc-123).
+- **No External Databases:**
+    - You strictly cannot use Redis, MySQL, Postgres, or etcd.
+    - *Goal:* You must implement the persistence layer yourself. You will learn how to serialize in-memory structs to binary formats and fsync them to disk to ensure data survives a power cut.
+
+## **4. Implementation Roadmap**
+
+This roadmap simulates a “Crawl, Walk, Run” engineering methodology.
+
+### **Sprint 1: The Skeleton**
+
+Focus: Networking, RPCs, and Basic Storage.
+
+Goal: A client can upload a single file to a single DataNode via the Master.
+
+- **Key Deliverables:**
+    - **Protocol Definitions:** .proto files defining RegisterDataNode, GetChunkLocation, and AssignChunk.
+    - **Registration Flow:** DataNodes start up, dial the Master, and register their IP/Port. Master adds them to an ActiveNodes map protected by a sync.RWMutex.
+    - **Simple Write:**
+        1. Client asks Master: “I want to write test.txt.”
+        2. Master generates ChunkID, picks 1 DataNode, returns info.
+        3. Client connects to DataNode and pushes bytes.
+        4. DataNode writes bytes to disk.
+- **Engineering Spotlight:** How do you handle a “partial write”? If the client crashes halfway through writing a chunk, you have a garbage file on disk. (Hint: Use temporary files and rename on success).
+
+### **Sprint 2: The Logic**
+
+Focus: Chunking, Namespace, and Metadata Persistence.
+
+Goal: Support multi-chunk files and Master durability.
+
+- **Key Deliverables:**
+    - **Chunking Calculator:** Logic to map byte offsets to chunks. (e.g., “Read byte 70,000,000” -> This is inside Chunk #2 at offset 2,914,560).
+    - **File Reconstruction:** Client fetches Chunk 1 from Node A, Chunk 2 from Node B, stitches them, and presents the full file to the user.
+    - **Write-Ahead Log (WAL):**
+        - Before the Master updates its in-memory map for a new file, it must append an entry to master.log.
+        - Format: [OP_CODE (1 byte)][LENGTH (4 bytes)][PAYLOAD (variable)].
+        - Implement a Recover() function that reads this file line-by-line on startup to rebuild the memory state.
+
+### **Sprint 3: The Hard Part - Replication**
+
+Focus: Fault Tolerance and Pipelined Writes.
+
+Goal: The system survives a node failure without data loss, and writes are optimized for bandwidth.
+
+- **Key Deliverables:**
+    - **Replication Factor:** Configurable (default 3). The Master must assign 3 distinct DataNodes for every chunk.
+    - **The Write Pipeline (Critical):**
+        - *Naive approach:* Client sends data to Node A, then Node B, then Node C. (Slow, bottleneck is Client bandwidth).
+        - *Pipeline approach:* Client sends to Node A. Node A stores it *and simultaneously* forwards it to Node B. Node B stores and forwards to Node C.
+        - Acknowledgment flows upstream: C -> B -> A -> Client.
+    - **Passive Recovery:** If a DataNode crashes, the Master notices (missing heartbeats). The Master scans its map for all chunks that were on the dead node. It finds other replicas and instructs them to copy the data to a new, healthy node to restore the replication factor to 3.
+
+### **Sprint 4: Edge Cases & Consistency**
+
+Focus: Data Integrity, Corruption, and “Split Brain” scenarios.
+
+Goal: Production readiness and stress testing.
+
+- **Key Deliverables:**
+    - **Bit Rot Protection:** Hardware disks occasionally flip bits.
+        - DataNodes must compute a CRC32 checksum when writing a chunk.
+        - When reading, re-compute checksum. If it mismatches, return a “DataCorrupt” error. The Client must then try a different replica.
+    - **Stale Chunk Handling:**
+        - Scenario: Node A goes offline. Master updates the version number of a file chunk. Node A comes back online with the old version.
+        - Master must detect the version mismatch via Block Reports and instruct Node A to delete the stale chunk.
+    - **Chaos Monkey Demo:** A script that continuously uploads files while randomly kill -9ing DataNode processes. The system must not lose data or return corrupted bytes.
+
+## **5. Deliverables**
+
+1. **Source Code:** A GitHub repository. Code must be idiomatic (e.g., proper Go error handling, Rust Result types) and well-commented.
+2. **Architecture Diagram:** A high-resolution visual map showing the Control Plane vs. Data Plane.
+3. **RFC/Design Doc:** A written document defending your choices.
+    - *Required Section:* **“Failure Scenarios”**. You must explicitly list: “If the Master crashes during a Write Pipeline operation, X happens. If the Client crashes after sending 99% of bytes, Y happens.”
