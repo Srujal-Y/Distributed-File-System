@@ -1,6 +1,3 @@
-# -------------------------------
-# DataNode.py - Part 1
-# -------------------------------
 import socket
 import threading
 import pickle
@@ -11,9 +8,7 @@ import uuid
 import zlib
 from utils import save_pickle, load_pickle, generate_chunk_id
 
-# -------------------------------
-# Configuration
-# -------------------------------
+
 MASTER_HOST = "127.0.0.1"
 MASTER_PORT = 9000
 
@@ -25,18 +20,13 @@ PORT = int(sys.argv[1])
 DATA_DIR = f"./data_{PORT}"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-HEARTBEAT_INTERVAL = 3      # seconds
-BLOCK_REPORT_INTERVAL = 30  # seconds
+HEARTBEAT_INTERVAL = 3      
+BLOCK_REPORT_INTERVAL = 30  
 
-# -------------------------------
-# In-memory state
-# -------------------------------
-# chunk_id -> {"filename": ..., "checksum": ..., "size": ...}
+
 CHUNKS = {}
 CHUNKS_LOCK = threading.Lock()
-# -------------------------------
-# Heartbeat & Block Report Threads
-# -------------------------------
+
 def send_heartbeat():
     while True:
         try:
@@ -46,7 +36,7 @@ def send_heartbeat():
             s.sendall(pickle.dumps(msg))
             resp = pickle.loads(s.recv(4096))
             s.close()
-            # print(f"[DATANODE {PORT}] Heartbeat acknowledged.")
+            
         except Exception as e:
             print(f"[DATANODE {PORT}] Heartbeat error: {e}")
         time.sleep(HEARTBEAT_INTERVAL)
@@ -62,7 +52,7 @@ def send_block_report():
             s.sendall(pickle.dumps(msg))
             resp = pickle.loads(s.recv(4096))
             s.close()
-            # print(f"[DATANODE {PORT}] Block report sent.")
+            
         except Exception as e:
             print(f"[DATANODE {PORT}] Block report error: {e}")
         time.sleep(BLOCK_REPORT_INTERVAL)
@@ -70,9 +60,7 @@ def send_block_report():
 def start_background_threads():
     threading.Thread(target=send_heartbeat, daemon=True).start()
     threading.Thread(target=send_block_report, daemon=True).start()
-# -------------------------------
-# DataNode.py - Part 2
-# -------------------------------
+
 def write_chunk(chunk_id, data):
     """
     Write a chunk to disk with checksum
@@ -83,7 +71,7 @@ def write_chunk(chunk_id, data):
         tmp_path = file_path + ".tmp"
         with open(tmp_path, "wb") as f:
             f.write(data)
-        os.rename(tmp_path, file_path)  # atomic rename
+        os.rename(tmp_path, file_path)  
         with CHUNKS_LOCK:
             CHUNKS[chunk_id] = {"checksum": checksum, "size": len(data)}
         print(f"[DATANODE {PORT}] Stored chunk {chunk_id} ({len(data)} bytes)")
@@ -92,52 +80,45 @@ def write_chunk(chunk_id, data):
 
 def handle_client_connection(conn, addr):
     """
-    Handles incoming chunks from clients or pipeline replication.
-    Reads the full message before unpickling to avoid truncation errors.
-    Supports versioning, checksum, and optional pipeline replication.
+    Receives chunk, stores it, and forwards to replicas (pipeline).
     """
     try:
-        # Read full message until connection closes
-        chunks = []
-        while True:
-            part = conn.recv(4096)
-            if not part:
-                break
-            chunks.append(part)
-        if not chunks:
-            return
-        data = b"".join(chunks)
+        raw = conn.recv(1024 * 1024 * 50)
+        msg = pickle.loads(raw)
 
-        msg = pickle.loads(data)
+        chunk_id = msg["chunk_id"]
+        data = msg["content"]
+        replicate_to = msg.get("replicate_to", [])
 
-        # Pipeline or client upload
-        if "chunk_id" in msg and "content" in msg:
-            chunk_id = msg["chunk_id"]
-            content = msg["content"]
-            version = msg.get("version", 1)
+        write_chunk(chunk_id, data)
 
-            # Store chunk safely
-            write_chunk_safe(chunk_id, content, version)
+        
+        for host, port in replicate_to:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.connect((host, int(port)))
 
-            # Forward to other DataNodes if pipeline replication info provided
-            if "replicate_to" in msg:
-                targets = msg["replicate_to"]  # list of (host, port)
-                threading.Thread(
-                    target=start_pipeline_forward,
-                    args=(chunk_id, content, targets),
-                    daemon=True
-                ).start()
+                forward_msg = {
+                    "chunk_id": chunk_id,
+                    "content": data,
+                    "replicate_to": []
+                }
 
-            # ACK back to sender
-            conn.sendall(pickle.dumps({"status": "ok"}))
+                s.sendall(pickle.dumps(forward_msg))
+                s.recv(4096)
+                s.close()
 
-        else:
-            conn.sendall(pickle.dumps({"error": "Invalid message"}))
+            except Exception as e:
+                print(f"[DATANODE {PORT}] Replication to {host}:{port} failed: {e}")
+
+        conn.sendall(pickle.dumps({"status": "ok"}))
 
     except Exception as e:
-        print(f"[DATANODE {PORT}] Connection handler error: {e}")
+        print(f"[DATANODE {PORT}] Handler error: {e}")
+
     finally:
         conn.close()
+
 
 
 def start_server():
@@ -150,9 +131,6 @@ def start_server():
     while True:
         conn, addr = server_sock.accept()
         threading.Thread(target=handle_client_connection, args=(conn, addr), daemon=True).start()
-# -------------------------------
-# DataNode.py - Part 3
-# -------------------------------
 
 def register_with_master():
     """
@@ -162,7 +140,7 @@ def register_with_master():
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((MASTER_HOST, MASTER_PORT))
-            msg = {"port": PORT}  # registration
+            msg = {"port": PORT}  
             s.sendall(pickle.dumps(msg))
             resp = pickle.loads(s.recv(4096))
             if resp.get("status") == "ok":
@@ -187,7 +165,7 @@ def send_heartbeat(node_id):
             s.sendall(pickle.dumps(msg))
             resp = pickle.loads(s.recv(4096))
             if resp.get("status") == "ok":
-                pass  # heartbeat acknowledged
+                pass  
             s.close()
         except Exception as e:
             print(f"[DATANODE {PORT}] Heartbeat failed: {e}")
@@ -218,7 +196,7 @@ def start_pipeline_forward(chunk_id, content, target_nodes):
     """
     for host, port in target_nodes:
         if port == PORT:
-            continue  # skip self
+            continue  
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((host, port))
@@ -235,46 +213,46 @@ def main():
     global NODE_ID
     NODE_ID = register_with_master()
 
-    # Start heartbeat thread
+    
     threading.Thread(target=send_heartbeat, args=(NODE_ID,), daemon=True).start()
 
-    # Start block report thread
+    
     threading.Thread(target=send_block_report, args=(NODE_ID,), daemon=True).start()
 
-    # Start TCP server to receive chunks (client uploads or replication)
+    
     start_server()
 
 if __name__ == "__main__":
-    # Ensure DATA_DIR exists
+    
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
 
     main()
-# -------------------------------
-# DataNode.py - Part 4 (Checksum & Version Integration)
-# -------------------------------
+
 
 def write_chunk_safe(chunk_id, data, version=1):
     """
-    Stores chunk safely with checksum, versioning, and temp file atomic write.
+    Store chunk safely with checksum, versioning, and atomic temp file write.
     Updates CHUNKS dict and disk meta file.
     """
     file_path = os.path.join(DATA_DIR, chunk_id)
     meta_path = file_path + ".meta"
     tmp_path = file_path + ".tmp"
 
+    
     checksum = zlib.crc32(data)
 
-    # Write data to temp file first
+    
     with open(tmp_path, "wb") as f:
         f.write(data)
     os.replace(tmp_path, file_path)
 
-    # Save meta info
+    
     meta = {"checksum": checksum, "version": version}
-    save_pickle(meta_path, meta)
+    with open(meta_path, "wb") as f:
+        pickle.dump(meta, f)
 
-    # Update in-memory state
+    
     with CHUNKS_LOCK:
         CHUNKS[chunk_id] = {"checksum": checksum, "size": len(data), "version": version}
 
@@ -283,7 +261,9 @@ def write_chunk_safe(chunk_id, data, version=1):
 
 def load_chunk_safe(chunk_id):
     """
-    Loads chunk data and verifies checksum. Raises Exception if corrupted.
+    Loads a chunk and verifies its checksum.
+    Raises Exception if data is corrupted (bit rot detected).
+    Returns: data, version
     """
     file_path = os.path.join(DATA_DIR, chunk_id)
     meta_path = file_path + ".meta"
@@ -291,16 +271,50 @@ def load_chunk_safe(chunk_id):
     if not os.path.exists(file_path) or not os.path.exists(meta_path):
         raise FileNotFoundError(f"Chunk {chunk_id} missing")
 
-    data = open(file_path, "rb").read()
+   
+    with open(file_path, "rb") as f:
+        data = f.read()
+
+    
     meta = load_pickle(meta_path)
     checksum = meta["checksum"]
     version = meta["version"]
 
+    
     if zlib.crc32(data) != checksum:
-        raise Exception(f"Chunk {chunk_id} corrupted!")
+        raise Exception(f"[DATANODE {PORT}] Chunk {chunk_id} corrupted! "
+                        f"(expected crc={checksum}, got crc={zlib.crc32(data)})")
 
+    
     with CHUNKS_LOCK:
-        CHUNKS[chunk_id]["version"] = version
+        if chunk_id in CHUNKS:
+            CHUNKS[chunk_id]["version"] = version
+        else:
+            CHUNKS[chunk_id] = {"checksum": checksum, "size": len(data), "version": version}
+
+    return data, version
+
+def read_chunk_safe(chunk_id):
+    """
+    Read a chunk and verify CRC32 checksum.
+    Raises Exception if data is corrupted.
+    """
+    file_path = os.path.join(DATA_DIR, chunk_id)
+    meta_path = file_path + ".meta"
+
+    if not os.path.exists(file_path) or not os.path.exists(meta_path):
+        raise FileNotFoundError(f"Chunk {chunk_id} missing on DataNode {PORT}")
+
+    with open(file_path, "rb") as f:
+        data = f.read()
+    with open(meta_path, "rb") as f:
+        meta = pickle.load(f)
+
+    checksum = meta["checksum"]
+    version = meta["version"]
+
+    if zlib.crc32(data) != checksum:
+        raise Exception(f"[DATANODE {PORT}] Chunk {chunk_id} corrupted! CRC mismatch.")
 
     return data, version
 
@@ -332,21 +346,20 @@ def handle_client_connection(conn, addr):
             return
         msg = pickle.loads(data)
 
-        # Pipeline or client upload
+       
         if "chunk_id" in msg and "content" in msg:
             chunk_id = msg["chunk_id"]
             content = msg["content"]
             version = msg.get("version", 1)
 
-            # Store chunk safely
+            
             write_chunk_safe(chunk_id, content, version)
 
-            # Forward to other DataNodes if pipeline replication info provided
             if "replicate_to" in msg:
-                targets = msg["replicate_to"]  # list of (host, port)
+                targets = msg["replicate_to"]
                 threading.Thread(target=start_pipeline_forward, args=(chunk_id, content, targets), daemon=True).start()
 
-            # ACK back to sender
+    
             conn.sendall(pickle.dumps({"status": "ok"}))
 
         else:
@@ -356,9 +369,7 @@ def handle_client_connection(conn, addr):
         print(f"[DATANODE {PORT}] Connection handler error: {e}")
     finally:
         conn.close()
-# -------------------------------
-# DataNode.py - Part 5 (Main Loop & Startup)
-# -------------------------------
+
 
 def main():
     """
@@ -370,21 +381,20 @@ def main():
     global NODE_ID
     NODE_ID = register_with_master()
 
-    # Start heartbeat thread
+    
     threading.Thread(target=send_heartbeat, args=(NODE_ID,), daemon=True).start()
 
-    # Start block report thread
+    
     threading.Thread(target=send_block_report, args=(NODE_ID,), daemon=True).start()
 
-    # Start TCP server to receive chunks (client uploads or replication)
+    
     start_server()
 
 
 if __name__ == "__main__":
-    # Ensure data directory exists
-    if not os.path.exists(DATA_DIR):
-        os.makedirs(DATA_DIR)
+    if len(sys.argv) != 2:
+        print("Usage: python datanode.py <port>")
+        sys.exit(1)
 
-    print(f"[DATANODE {PORT}] Starting up...")
-
-    main()
+    PORT = int(sys.argv[1])
+    start_datanode(PORT) 

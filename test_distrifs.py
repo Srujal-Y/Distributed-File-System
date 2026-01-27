@@ -6,9 +6,6 @@ import sys
 import random
 import signal
 
-# -------------------------------
-# Configuration
-# -------------------------------
 MASTER_HOST = "127.0.0.1"
 MASTER_PORT = 9000
 DATANODE_PORTS = [9100, 9101, 9102]
@@ -18,9 +15,7 @@ DATANODE_DOWN_TIME = 3
 
 processes = []
 
-# -------------------------------
-# Helper Functions
-# -------------------------------
+
 
 def wait_for_port(host, port, timeout=30):
     start = time.time()
@@ -50,16 +45,14 @@ def create_test_file():
         f.write("Hello DistriFS!\n" * 20)
     print(f"[TEST] Test file '{TEST_FILE}' ready.")
 
-# -------------------------------
-# Start Components
-# -------------------------------
+
 
 def start_master():
     print("[TEST] Starting Master...")
     master = subprocess.Popen([sys.executable, "master.py"])
     processes.append(master)
 
-    # Wait for Master to actually bind
+    
     wait_for_port(MASTER_HOST, MASTER_PORT, timeout=30)
     print("[TEST] Master ready.")
     return master
@@ -68,7 +61,7 @@ def start_datanode(port):
     proc = subprocess.Popen([sys.executable, "datanode.py", str(port)])
     processes.append(proc)
 
-    # Wait briefly for registration retries
+    
     time.sleep(1)
     print(f"[TEST] DataNode {port} started.")
     return proc
@@ -80,9 +73,7 @@ def start_client_upload(file):
     client.wait()
     print(f"[TEST] Client upload complete.")
 
-# -------------------------------
-# Chaos Monkey Simulation
-# -------------------------------
+
 
 def chaos_monkey_loop():
     """
@@ -103,35 +94,31 @@ def chaos_monkey_loop():
         time.sleep(CHAOS_INTERVAL)
     print("[CHAOS_MONKEY] Chaos simulation finished.")
 
-# -------------------------------
-# Main Test Function
-# -------------------------------
+
 
 def run_test():
     cleanup()
     create_test_file()
 
     master = start_master()
-    time.sleep(2)  # ensure Master is fully ready on Windows
+    time.sleep(2)  
 
-    # Start all DataNodes
+    
     for port in DATANODE_PORTS:
         start_datanode(port)
-    time.sleep(3)  # give DataNodes time to register
+    time.sleep(3)  
 
-    # Upload file
+    
     start_client_upload(TEST_FILE)
 
-    # Run Chaos Monkey simulation
+    
     chaos_monkey_loop()
 
-    # Final Cleanup
+    
     cleanup()
     print("[TEST] All processes terminated. Test completed successfully.")
 
-# -------------------------------
-# Entry Point
-# -------------------------------
+
 
 if __name__ == "__main__":
     run_test()

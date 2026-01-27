@@ -1,6 +1,3 @@
-# -------------------------------
-# Client.py - DistriFS Client
-# -------------------------------
 import socket
 import pickle
 import os
@@ -10,17 +7,11 @@ import math
 import time
 from utils import generate_chunk_id
 
-# -------------------------------
-# Configuration
-# -------------------------------
 MASTER_HOST = "127.0.0.1"
 MASTER_PORT = 9000
-CHUNK_SIZE = 64 * 1024  # 64 KB for testing; can increase to 64 MB
-RETRY_LIMIT = 3          # retries for failed chunk uploads
+CHUNK_SIZE = 64 * 1024  
+RETRY_LIMIT = 3          
 
-# -------------------------------
-# Helper Functions
-# -------------------------------
 def request_chunk_assignment(filename):
     """
     Ask Master to assign chunk(s) for a file.
@@ -51,59 +42,113 @@ def send_chunk_to_datanode(chunk_id, content, datanode_host, datanode_port):
         return False
 
 def upload_file(filename):
-    """
-    Uploads a file in chunks with pipelined replication.
-    """
+
     if not os.path.exists(filename):
         print(f"[CLIENT] File '{filename}' does not exist.")
         return
 
     print(f"[CLIENT] Requesting chunk assignment from Master for '{filename}'...")
     assignment = request_chunk_assignment(filename)
+
     chunk_ids = assignment["chunk_ids"]
-    assigned_nodes_list = assignment["assigned_nodes"]
+    pipelines = assignment["assigned_nodes"]
 
     with open(filename, "rb") as f:
-        for i, chunk_id in enumerate(chunk_ids):
-            data = f.read(CHUNK_SIZE)
-            if not data:
-                break
+        file_data = f.read()
 
-            # Pipelinined replication
-            target_nodes = assigned_nodes_list[i]
-            first_node = target_nodes[0]
-            print(f"[CLIENT] Uploading chunk {chunk_id} to pipeline: {target_nodes}")
+    for chunk_id, pipeline in zip(chunk_ids, pipelines):
 
-            # Send to first DataNode
-            success = send_chunk_to_datanode(chunk_id, data, first_node[0], first_node[1])
-            if not success:
-                print(f"[CLIENT] Failed to upload chunk {chunk_id} to first node, skipping chunk.")
-                continue
+        print(f"[CLIENT] Uploading chunk {chunk_id} to pipeline: {pipeline}")
 
-            # Forward to remaining nodes via pipeline (from first node)
-            # For simplicity, client sends directly to all remaining nodes (can also implement client-to-node forwarding)
-            for host, port in target_nodes[1:]:
-                port = int(port)
-                while retry_count < RETRY_LIMIT:
-                    success = send_chunk_to_datanode(chunk_id, data, host, port)
-                    if success:
-                        break
-                    retry_count += 1
-                    time.sleep(1)
-                if not success:
-                    print(f"[CLIENT] Warning: Failed to upload chunk {chunk_id} to node {host}:{port}")
+        first_node = pipeline[0]
+        host, port = first_node
 
-            print(f"[CLIENT] Chunk {chunk_id} upload complete.")
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((host, int(port)))
+
+            msg = {
+                "chunk_id": chunk_id,
+                "content": file_data,
+                "replicate_to": pipeline[1:]
+            }
+
+            s.sendall(pickle.dumps(msg))
+            resp = pickle.loads(s.recv(4096))
+            s.close()
+
+            if resp.get("status") != "ok":
+                print(f"[CLIENT] Failed to upload chunk {chunk_id}")
+            else:
+                print(f"[CLIENT] Chunk {chunk_id} uploaded successfully")
+
+        except Exception as e:
+            print(f"[CLIENT] Upload error for chunk {chunk_id}: {e}")
 
     print(f"[CLIENT] File '{filename}' upload finished ({len(chunk_ids)} chunks).")
 
+def download_file(filename, dest_path):
+    """
+    Downloads a file from the distributed file system.
+    Reads all chunks, verifies CRC, and reconstructs the file locally.
+    """
+    print(f"[CLIENT] Requesting chunk locations from Master for '{filename}'...")
+    assignment = request_chunk_assignment(filename)  
+    chunk_ids = assignment["chunk_ids"]
+    assigned_nodes_list = assignment["assigned_nodes"]
 
-# -------------------------------
-# Main
-# -------------------------------
+    with open(dest_path, "wb") as out_file:
+        for i, chunk_id in enumerate(chunk_ids):
+            target_nodes = assigned_nodes_list[i]
+            data = None
+
+           
+            for host, port in target_nodes:
+                try:
+                    data, version = read_chunk_safe(chunk_id) 
+                    print(f"[CLIENT] Successfully read chunk {chunk_id} (v{version}) from {host}:{port}")
+                    break
+                except Exception as e:
+                    print(f"[CLIENT] Warning: Failed to read chunk {chunk_id} from {host}:{port}: {e}")
+
+            if data is None:
+                print(f"[CLIENT] ERROR: Could not read chunk {chunk_id} from any replica. Aborting.")
+                return
+
+            out_file.write(data)
+
+    print(f"[CLIENT] File '{filename}' successfully reconstructed at '{dest_path}'")
+
+
+
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python client.py <filename>")
+
+    
+    if len(sys.argv) == 2:
+        upload_file(sys.argv[1])
+        sys.exit(0)
+
+    
+    if len(sys.argv) < 3:
+        print("Usage: python client.py <upload/download> <filename> [dest_path_for_download]")
         sys.exit(1)
 
-    upload_file(sys.argv[1])
+    action = sys.argv[1].lower()
+    filename = sys.argv[2]
+
+    if action == "upload":
+        upload_file(filename)
+
+    elif action == "download":
+        if len(sys.argv) != 4:
+            print("Provide destination path for download.")
+            sys.exit(1)
+        dest_path = sys.argv[3]
+        download_file(filename, dest_path)
+
+    else:
+        print("Unknown action. Use 'upload' or 'download'.")
+
+
