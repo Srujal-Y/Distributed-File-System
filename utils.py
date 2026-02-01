@@ -150,3 +150,4 @@ def read_master_epoch(epoch_path: str = "master.epoch") -> int:
             return int(f.read().strip() or "0")
     except Exception:
         return 0
+

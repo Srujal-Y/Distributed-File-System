@@ -154,3 +154,4 @@ service DataNodeControl {
   rpc CopyChunk(CopyChunkRequest) returns (ControlStatus);
   rpc DeleteChunk(DeleteChunkRequest) returns (ControlStatus);
 }
+
