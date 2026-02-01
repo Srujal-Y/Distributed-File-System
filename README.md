@@ -91,7 +91,6 @@ All persistence is handled via the master's WAL plus DataNode local disks.
 - [Operational Notes](#operational-notes)
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
-- [License](#license)
 
 ---
 
