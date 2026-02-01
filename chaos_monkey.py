@@ -135,8 +135,20 @@ def main():
             dn_dir.mkdir(parents=True, exist_ok=True)
             datanodes.append(_start_datanode(env, dp, cp, dn_dir))
 
-        # Create namespace
-        _run_client(["mkdir", "/chaos"], env)
+        # Give DataNodes time to register + send initial heartbeats/block reports
+        time.sleep(float(env.get("DISTRIFS_HEARTBEAT_INTERVAL_S", "3.0")) + 0.5)
+
+        # Create namespace (retry while the master is still learning the cluster)
+        for _ in range(40):
+            try:
+                _run_client(["mkdir", "/chaos"], env)
+                break
+            except subprocess.CalledProcessError as e:
+                msg = str(e)
+                if "not enough active DataNodes" in msg or "UNAVAILABLE" in msg:
+                    time.sleep(0.25)
+                    continue
+                raise
 
         uploaded: dict[str, tuple[Path, str]] = {}  # remote -> (local_path, sha256)
 

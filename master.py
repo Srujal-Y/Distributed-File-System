@@ -354,34 +354,47 @@ def _dec_ref(chunk_id: str) -> None:
         GC_QUEUE.append(chunk_id)
 
 def _gc_loop() -> None:
-    while not STOP.is_set():
-        time.sleep(GC_INTERVAL)
-        with STATE_LOCK:
-            if not GC_QUEUE:
-                continue
-            chunk_id = GC_QUEUE.pop(0)
-            rec = CHUNKS.pop(chunk_id, None)
-            if not rec:
-                continue
-            replicas = list(rec.replicas)
-        # best-effort delete from known replicas
-        for node_id in replicas:
-            ni = None
-            with STATE_LOCK:
-                ni = NODES.get(node_id)
-            if not ni:
-                continue
-            try:
-                ch = grpc.insecure_channel(f"{ni.host}:{ni.control_port}")
-                stub = pb_grpc.DataNodeControlStub(ch)
-                md = (("x-epoch", str(LEADER_EPOCH)),)
-                stub.DeleteChunk(pb.DeleteChunkRequest(chunk_id=chunk_id), timeout=4.0, metadata=md)
-            except Exception:
-                pass
+    """Garbage-collect unreferenced chunks.
 
-# -------------------------
-# Health + repair
-# -------------------------
+    Important for tests: we *drain* the GC queue each cycle, rather than deleting
+    one chunk per interval (otherwise large files take too long to collect).
+    """
+    while not STOP.is_set():
+        # Sleep in small quanta so STOP can interrupt promptly.
+        slept = 0.0
+        while slept < GC_INTERVAL and not STOP.is_set():
+            dt = min(0.25, GC_INTERVAL - slept)
+            time.sleep(dt)
+            slept += dt
+        if STOP.is_set():
+            break
+
+        # Drain queue snapshot under lock.
+        batch: list[tuple[str, list[str]]] = []
+        with STATE_LOCK:
+            while GC_QUEUE:
+                chunk_id = GC_QUEUE.pop(0)
+                rec = CHUNKS.pop(chunk_id, None)
+                if not rec:
+                    continue
+                batch.append((chunk_id, list(rec.replicas)))
+
+        # Best-effort delete from known replicas (no lock held during RPC).
+        for chunk_id, replicas in batch:
+            for node_id in replicas:
+                ni = None
+                with STATE_LOCK:
+                    ni = NODES.get(node_id)
+                if not ni:
+                    continue
+                try:
+                    ch = grpc.insecure_channel(f"{ni.host}:{ni.control_port}")
+                    stub = pb_grpc.DataNodeControlStub(ch)
+                    md = (("x-epoch", str(LEADER_EPOCH)),)
+                    stub.DeleteChunk(pb.DeleteChunkRequest(chunk_id=chunk_id), timeout=4.0, metadata=md)
+                except Exception:
+                    pass
+
 def _mark_dead_nodes() -> List[str]:
     now = time.time()
     dead = []
