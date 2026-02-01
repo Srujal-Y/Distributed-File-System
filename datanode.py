@@ -313,12 +313,32 @@ def _master_stub():
     ch = grpc.insecure_channel(f"{MASTER_HOST}:{MASTER_PORT}")
     return pb_grpc.MasterServiceStub(ch)
 
+def _update_master_from_error(msg: str) -> bool:
+    global MASTER_HOST, MASTER_PORT
+    if not msg or not msg.startswith("NotLeader:"):
+        return False
+    target = msg.split(":", 1)[1].strip()
+    if not target or ":" not in target:
+        return False
+    host, port = target.rsplit(":", 1)
+    try:
+        MASTER_HOST = host
+        MASTER_PORT = int(port)
+        return True
+    except ValueError:
+        return False
+
 def _register() -> int:
     global EPOCH_SEEN
     stub = _master_stub()
     r = stub.RegisterDataNode(pb.RegisterDataNodeRequest(host=HOST, data_port=DATA_PORT, control_port=CTRL_PORT), timeout=6.0)
     if not r.status.ok:
-        raise RuntimeError(r.status.error.message if r.status.error else "register failed")
+        msg = r.status.error.message if r.status.error else "register failed"
+        if _update_master_from_error(msg):
+            stub = _master_stub()
+            r = stub.RegisterDataNode(pb.RegisterDataNodeRequest(host=HOST, data_port=DATA_PORT, control_port=CTRL_PORT), timeout=6.0)
+        if not r.status.ok:
+            raise RuntimeError(r.status.error.message if r.status.error else "register failed")
     with EPOCH_LOCK:
         EPOCH_SEEN = int(r.data.epoch)
     return EPOCH_SEEN
@@ -332,6 +352,9 @@ def _hb_loop():
                 epoch = EPOCH_SEEN
             r = stub.Heartbeat(pb.HeartbeatRequest(node_id=NODE_ID, epoch=epoch), timeout=4.0)
             if not r.status.ok:
+                if r.status.error and _update_master_from_error(r.status.error.message):
+                    _register()
+                    continue
                 # stale epoch -> re-register
                 _register()
         except Exception:
@@ -365,6 +388,9 @@ def _br_loop():
             chunks = _scan_chunks()
             r = stub.BlockReport(pb.BlockReportRequest(node_id=NODE_ID, epoch=epoch, chunks=chunks), timeout=8.0)
             if not r.status.ok:
+                if r.status.error and _update_master_from_error(r.status.error.message):
+                    _register()
+                    continue
                 _register()
         except Exception:
             pass
@@ -405,4 +431,3 @@ def serve():
 
 if __name__ == "__main__":
     serve()
-

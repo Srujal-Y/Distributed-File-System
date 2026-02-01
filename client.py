@@ -20,10 +20,14 @@ MASTER_HOST = os.getenv("DISTRIFS_MASTER_HOST", "127.0.0.1")
 MASTER_PORT = int(os.getenv("DISTRIFS_MASTER_PORT", "9000"))
 USER = os.getenv("DISTRIFS_USER", "user")
 
-CHUNK_SIZE = int(os.getenv("DISTRIFS_CHUNK_SIZE", str(256 * 1024)))
+CHUNK_SIZE = int(os.getenv("DISTRIFS_CHUNK_SIZE", str(64 * 1024 * 1024)))
+CACHE_TTL_S = float(os.getenv("DISTRIFS_CLIENT_CACHE_TTL_S", "10.0"))
+
+_MASTER_ADDR = {"host": MASTER_HOST, "port": MASTER_PORT}
+_PLAN_CACHE: dict[str, tuple[float, pb.GetFilePlanResponse]] = {}
 
 def _stub():
-    ch = grpc.insecure_channel(f"{MASTER_HOST}:{MASTER_PORT}")
+    ch = grpc.insecure_channel(f"{_MASTER_ADDR['host']}:{_MASTER_ADDR['port']}")
     return pb_grpc.MasterServiceStub(ch)
 
 def _md():
@@ -33,26 +37,68 @@ def _die(msg: str, code: int = 2):
     print(msg, file=sys.stderr, flush=True)
     raise SystemExit(code)
 
+def _update_leader(error_msg: str) -> bool:
+    if not error_msg or not error_msg.startswith("NotLeader:"):
+        return False
+    target = error_msg.split(":", 1)[1].strip()
+    if not target:
+        return False
+    if ":" not in target:
+        return False
+    host, port = target.rsplit(":", 1)
+    if not host or not port:
+        return False
+    try:
+        _MASTER_ADDR["host"] = host
+        _MASTER_ADDR["port"] = int(port)
+        return True
+    except ValueError:
+        return False
+
+def _call_with_leader(fn):
+    for _ in range(2):
+        stub = _stub()
+        resp = fn(stub)
+        if getattr(resp, "status", None) is None:
+            return resp
+        if resp.status.ok:
+            return resp
+        if _update_leader(resp.status.error.message if resp.status.error else ""):
+            continue
+        return resp
+    return resp
+
+def _get_file_plan(remote_path: str, refresh: bool = False) -> pb.GetFilePlanResponse:
+    now = time.time()
+    if not refresh:
+        cached = _PLAN_CACHE.get(remote_path)
+        if cached and cached[0] > now:
+            return cached[1]
+    r = _call_with_leader(
+        lambda stub: stub.GetFilePlan(pb.GetFilePlanRequest(path=remote_path), timeout=6.0, metadata=_md())
+    )
+    if not r.status.ok:
+        _die(r.status.error.message if r.status.error else "GetFilePlan failed")
+    _PLAN_CACHE[remote_path] = (now + CACHE_TTL_S, r.data)
+    return r.data
+
 # -------------------------
 # Namespace commands
 # -------------------------
 def mkdir(remote_dir: str, mode: int = 0o700):
-    stub = _stub()
-    r = stub.Mkdir(pb.MkdirRequest(path=remote_dir, mode=mode), timeout=6.0, metadata=_md())
+    r = _call_with_leader(lambda stub: stub.Mkdir(pb.MkdirRequest(path=remote_dir, mode=mode), timeout=6.0, metadata=_md()))
     if not r.status.ok:
         _die(r.status.error.message if r.status.error else "mkdir failed")
 
 def ls(remote_dir: str):
-    stub = _stub()
-    r = stub.Ls(pb.LsRequest(path=remote_dir), timeout=6.0, metadata=_md())
+    r = _call_with_leader(lambda stub: stub.Ls(pb.LsRequest(path=remote_dir), timeout=6.0, metadata=_md()))
     if not r.status.ok:
         _die(r.status.error.message if r.status.error else "ls failed")
     for e in r.data.entries:
         print(e)
 
 def stat(path: str):
-    stub = _stub()
-    r = stub.Stat(pb.StatRequest(path=path), timeout=6.0, metadata=_md())
+    r = _call_with_leader(lambda stub: stub.Stat(pb.StatRequest(path=path), timeout=6.0, metadata=_md()))
     if not r.status.ok:
         _die(r.status.error.message if r.status.error else "stat failed")
     d = r.data
@@ -60,14 +106,12 @@ def stat(path: str):
     print(f"{kind} owner={d.owner} mode={oct(d.mode)} size={d.size} chunks={d.chunk_count}")
 
 def rm(path: str, recursive: bool = False):
-    stub = _stub()
-    r = stub.Rm(pb.RmRequest(path=path, recursive=recursive), timeout=6.0, metadata=_md())
+    r = _call_with_leader(lambda stub: stub.Rm(pb.RmRequest(path=path, recursive=recursive), timeout=6.0, metadata=_md()))
     if not r.status.ok:
         _die(r.status.error.message if r.status.error else "rm failed")
 
 def mv(src: str, dst: str):
-    stub = _stub()
-    r = stub.Mv(pb.MvRequest(src=src, dst=dst), timeout=6.0, metadata=_md())
+    r = _call_with_leader(lambda stub: stub.Mv(pb.MvRequest(src=src, dst=dst), timeout=6.0, metadata=_md()))
     if not r.status.ok:
         _die(r.status.error.message if r.status.error else "mv failed")
 
@@ -162,7 +206,6 @@ def put(local_path: str, remote_path: str):
     total = os.path.getsize(p)
     print(f"[CLIENT] PUT {p} -> {remote_path} bytes={total} chunks={max(1,(total + CHUNK_SIZE - 1)//CHUNK_SIZE)} chunk_size={CHUNK_SIZE}", flush=True)
 
-    stub = _stub()
     with open(p, "rb") as f:
         idx = 0
         while True:
@@ -172,17 +215,34 @@ def put(local_path: str, remote_path: str):
             last_err = None
             for attempt in range(3):
                 try:
-                    ar = stub.AssignChunk(pb.AssignChunkRequest(path=remote_path, index=idx, max_size=CHUNK_SIZE), timeout=6.0, metadata=_md())
+                    ar = _call_with_leader(
+                        lambda stub: stub.AssignChunk(
+                            pb.AssignChunkRequest(path=remote_path, index=idx, max_size=CHUNK_SIZE),
+                            timeout=6.0,
+                            metadata=_md(),
+                        )
+                    )
                     if not ar.status.ok:
                         raise RuntimeError(ar.status.error.message if ar.status.error else "assign failed")
                     chunk_id = ar.data.chunk_id
                     version = int(ar.data.version)
                     pipeline = list(ar.data.pipeline)
                     checksum = _put_to_pipeline(pipeline, chunk_id, version, data)
-                    cr = stub.CommitChunk(pb.CommitChunkRequest(
-                        path=remote_path, index=idx, chunk_id=chunk_id, version=version,
-                        size=len(data), checksum=checksum, pipeline=pipeline
-                    ), timeout=6.0, metadata=_md())
+                    cr = _call_with_leader(
+                        lambda stub: stub.CommitChunk(
+                            pb.CommitChunkRequest(
+                                path=remote_path,
+                                index=idx,
+                                chunk_id=chunk_id,
+                                version=version,
+                                size=len(data),
+                                checksum=checksum,
+                                pipeline=pipeline,
+                            ),
+                            timeout=6.0,
+                            metadata=_md(),
+                        )
+                    )
                     if not cr.status.ok:
                         raise RuntimeError(cr.status.error.message if cr.status.error else "commit failed")
                     last_err = None
@@ -193,14 +253,11 @@ def put(local_path: str, remote_path: str):
             if last_err is not None:
                 raise RuntimeError(f"Failed PUT chunk idx={idx}: {last_err}")
             idx += 1
+    _PLAN_CACHE.pop(remote_path, None)
     print("[CLIENT] PUT complete.", flush=True)
 
 def get(remote_path: str, out_path: str):
-    stub = _stub()
-    r = stub.GetFilePlan(pb.GetFilePlanRequest(path=remote_path), timeout=6.0, metadata=_md())
-    if not r.status.ok:
-        _die(r.status.error.message if r.status.error else "GetFilePlan failed")
-    plan = r.data
+    plan = _get_file_plan(remote_path)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
     with open(out_path, "wb") as out:
@@ -220,15 +277,28 @@ def get(remote_path: str, out_path: str):
                 except Exception as e:
                     last = e
             if last is not None:
+                refreshed = _get_file_plan(remote_path, refresh=True)
+                replanned = next((p for p in refreshed.chunks if p.index == cp.index), None)
+                if replanned and replanned.replicas:
+                    last_retry = None
+                    for hp in replanned.replicas:
+                        try:
+                            data = _get_from_replica(hp.host, int(hp.port), replanned.chunk_id, int(replanned.version))
+                            if len(data) != int(replanned.size):
+                                raise RuntimeError("short read")
+                            out.write(data)
+                            last_retry = None
+                            break
+                        except Exception as e:
+                            last_retry = e
+                    if last_retry is None:
+                        continue
+                    raise RuntimeError(f"Chunk read failed after re-plan: {replanned.chunk_id}: {last_retry}")
                 raise RuntimeError(f"Chunk read failed: {cp.chunk_id}: {last}")
     print(f"[CLIENT] GET {remote_path} -> {out_path} bytes={plan.size}", flush=True)
 
 def getrange(remote_path: str, offset: int, length: int, out_path: str):
-    stub = _stub()
-    r = stub.GetFilePlan(pb.GetFilePlanRequest(path=remote_path), timeout=6.0, metadata=_md())
-    if not r.status.ok:
-        _die(r.status.error.message if r.status.error else "GetFilePlan failed")
-    plan = r.data
+    plan = _get_file_plan(remote_path)
     # compute which chunks to fetch
     remaining = length
     cur_off = 0
@@ -253,7 +323,23 @@ def getrange(remote_path: str, offset: int, length: int, out_path: str):
                 except Exception as e:
                     last = e
             if last is not None or data is None:
-                raise RuntimeError(f"Chunk read failed: {cp.chunk_id}: {last}")
+                refreshed = _get_file_plan(remote_path, refresh=True)
+                replanned = next((p for p in refreshed.chunks if p.index == cp.index), None)
+                if replanned and replanned.replicas:
+                    last_retry = None
+                    data = None
+                    for hp in replanned.replicas:
+                        try:
+                            data = _get_from_replica(hp.host, int(hp.port), replanned.chunk_id, int(replanned.version))
+                            last_retry = None
+                            break
+                        except Exception as e:
+                            last_retry = e
+                    if last_retry is not None or data is None:
+                        raise RuntimeError(f"Chunk read failed after re-plan: {replanned.chunk_id}: {last_retry}")
+                    cp = replanned
+                else:
+                    raise RuntimeError(f"Chunk read failed: {cp.chunk_id}: {last}")
             # slice
             s = max(0, offset - chunk_start)
             e = min(int(cp.size), s + remaining)
@@ -304,4 +390,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

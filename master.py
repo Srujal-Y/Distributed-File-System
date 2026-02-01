@@ -5,6 +5,7 @@ import os
 import time
 import threading
 import uuid
+import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -33,8 +34,17 @@ MASTER_HOST = os.getenv("DISTRIFS_MASTER_HOST", "127.0.0.1")
 MASTER_PORT = int(os.getenv("DISTRIFS_MASTER_PORT", "9000"))
 RF = int(os.getenv("DISTRIFS_RF", "3"))
 
+MASTER_ID = f"{MASTER_HOST}:{MASTER_PORT}"
+MASTER_PEERS = [p.strip() for p in os.getenv("DISTRIFS_MASTER_PEERS", "").split(",") if p.strip()]
+MASTER_PEERS = [p for p in MASTER_PEERS if p != MASTER_ID]
+ELECTION_ENABLED = bool(MASTER_PEERS)
+
 HB_INTERVAL = float(os.getenv("DISTRIFS_HB_INTERVAL_S", "3.0"))
 HB_TIMEOUT = float(os.getenv("DISTRIFS_HB_TIMEOUT_S", "9.0"))
+
+ELECTION_TIMEOUT_MIN = float(os.getenv("DISTRIFS_ELECTION_TIMEOUT_MIN_S", "1.5"))
+ELECTION_TIMEOUT_MAX = float(os.getenv("DISTRIFS_ELECTION_TIMEOUT_MAX_S", "3.0"))
+ELECTION_HEARTBEAT_S = float(os.getenv("DISTRIFS_ELECTION_HEARTBEAT_S", "0.5"))
 
 WAL_PATH = os.getenv("DISTRIFS_WAL", "master.wal")
 EPOCH_PATH = os.getenv("DISTRIFS_EPOCH_PATH", "master.epoch")
@@ -100,11 +110,37 @@ GC_QUEUE: List[str] = []                      # chunk_ids pending delete
 LEADER_EPOCH = 0
 STOP = threading.Event()
 
+ELECTION_LOCK = threading.Lock()
+CURRENT_TERM = 0
+VOTED_FOR: Optional[str] = None
+ROLE = "follower"  # follower | candidate | leader
+LAST_HEARTBEAT = time.time()
+CURRENT_LEADER_ID: Optional[str] = None
+
+def _set_role(role: str) -> None:
+    global ROLE
+    ROLE = role
+
+def _set_leader(leader_id: Optional[str]) -> None:
+    global CURRENT_LEADER_ID
+    CURRENT_LEADER_ID = leader_id
+
+def _not_leader_status():
+    leader = CURRENT_LEADER_ID or ""
+    return pb.Status(ok=False, error=pb.Error(message=f"NotLeader:{leader}"))
+
 def _ok(data=None):
     return pb.Status(ok=True), data
 
 def _err(msg: str):
     return pb.Status(ok=False, error=pb.Error(message=msg)), None
+
+def _require_leader():
+    if not ELECTION_ENABLED:
+        return None
+    if ROLE != "leader":
+        return _not_leader_status()
+    return None
 
 # -------------------------
 # Path helpers + permissions
@@ -230,6 +266,84 @@ def _release_leader_lock():
             _LEADER_LOCK_FH.close()
         finally:
             _LEADER_LOCK_FH = None
+
+
+def _peer_stub(peer: str) -> pb_grpc.MasterServiceStub:
+    ch = grpc.insecure_channel(peer)
+    return pb_grpc.MasterServiceStub(ch)
+
+def _majority() -> int:
+    return (len(MASTER_PEERS) + 1) // 2 + 1
+
+def _start_election() -> None:
+    global CURRENT_TERM, VOTED_FOR, LEADER_EPOCH, LAST_HEARTBEAT
+
+    with ELECTION_LOCK:
+        _set_role("candidate")
+        CURRENT_TERM += 1
+        term = CURRENT_TERM
+        VOTED_FOR = MASTER_ID
+        votes = 1
+        LAST_HEARTBEAT = time.time()
+
+    for peer in MASTER_PEERS:
+        try:
+            stub = _peer_stub(peer)
+            resp = stub.RequestVote(pb.RequestVoteRequest(term=term, candidate_id=MASTER_ID), timeout=1.5)
+            if resp.term > term:
+                with ELECTION_LOCK:
+                    CURRENT_TERM = resp.term
+                    VOTED_FOR = None
+                    _set_role("follower")
+                return
+            if resp.vote_granted:
+                votes += 1
+        except Exception:
+            continue
+
+    if votes >= _majority():
+        with ELECTION_LOCK:
+            _set_role("leader")
+            _set_leader(MASTER_ID)
+            LEADER_EPOCH = CURRENT_TERM
+            LAST_HEARTBEAT = time.time()
+
+def _heartbeat_loop() -> None:
+    global LAST_HEARTBEAT
+    while not STOP.is_set():
+        time.sleep(ELECTION_HEARTBEAT_S)
+        with ELECTION_LOCK:
+            if ROLE != "leader":
+                continue
+            term = CURRENT_TERM
+        for peer in MASTER_PEERS:
+            try:
+                stub = _peer_stub(peer)
+                resp = stub.AppendEntries(pb.AppendEntriesRequest(term=term, leader_id=MASTER_ID), timeout=1.0)
+                if resp.term > term:
+                    with ELECTION_LOCK:
+                        CURRENT_TERM = resp.term
+                        VOTED_FOR = None
+                        _set_role("follower")
+                        _set_leader(None)
+                    break
+            except Exception:
+                continue
+        LAST_HEARTBEAT = time.time()
+
+def _election_loop() -> None:
+    global LAST_HEARTBEAT
+    while not STOP.is_set():
+        timeout = random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX)
+        time.sleep(0.2)
+        if STOP.is_set():
+            break
+        with ELECTION_LOCK:
+            if ROLE == "leader":
+                continue
+            since = time.time() - LAST_HEARTBEAT
+        if since >= timeout:
+            _start_election()
 
 # -------------------------
 # WAL recovery
@@ -458,6 +572,9 @@ def _repair_one(chunk_id: str) -> None:
 # -------------------------
 class Master(pb_grpc.MasterServiceServicer):
     def RegisterDataNode(self, request, context):
+        status = _require_leader()
+        if status is not None:
+            return pb.RegisterDataNodeReply(status=status, data=pb.RegisterDataNodeResponse())
         user = _user_from_md(context)  # unused but keeps pattern
         host = (request.host or "").strip()
         if not host:
@@ -480,6 +597,9 @@ class Master(pb_grpc.MasterServiceServicer):
         return pb.RegisterDataNodeReply(status=st, data=pb.RegisterDataNodeResponse(node_id=node_id, epoch=LEADER_EPOCH))
 
     def Heartbeat(self, request, context):
+        status = _require_leader()
+        if status is not None:
+            return pb.HeartbeatReply(status=status, data=pb.HeartbeatResponse())
         if int(request.epoch) != LEADER_EPOCH:
             st, _ = _err("stale epoch")
             return pb.HeartbeatReply(status=st, data=pb.HeartbeatResponse())
@@ -493,6 +613,9 @@ class Master(pb_grpc.MasterServiceServicer):
         return pb.HeartbeatReply(status=st, data=pb.HeartbeatResponse())
 
     def BlockReport(self, request, context):
+        status = _require_leader()
+        if status is not None:
+            return pb.BlockReportReply(status=status, data=pb.BlockReportResponse())
         if int(request.epoch) != LEADER_EPOCH:
             st, _ = _err("stale epoch")
             return pb.BlockReportReply(status=st, data=pb.BlockReportResponse())
@@ -538,6 +661,9 @@ class Master(pb_grpc.MasterServiceServicer):
 
     # -------- Namespace ops --------
     def Mkdir(self, request, context):
+        status = _require_leader()
+        if status is not None:
+            return pb.MkdirReply(status=status, data=pb.MkdirResponse())
         user = _user_from_md(context)
         path = _norm(request.path)
         mode = int(request.mode) if request.mode else 0o755
@@ -566,6 +692,9 @@ class Master(pb_grpc.MasterServiceServicer):
         return pb.MkdirReply(status=st, data=pb.MkdirResponse())
 
     def Ls(self, request, context):
+        status = _require_leader()
+        if status is not None:
+            return pb.LsReply(status=status, data=pb.LsResponse())
         user = _user_from_md(context)
         path = _norm(request.path)
         with STATE_LOCK:
@@ -581,6 +710,9 @@ class Master(pb_grpc.MasterServiceServicer):
         return pb.LsReply(status=st, data=pb.LsResponse(entries=entries))
 
     def Stat(self, request, context):
+        status = _require_leader()
+        if status is not None:
+            return pb.StatReply(status=status, data=pb.StatResponse())
         user = _user_from_md(context)
         path = _norm(request.path)
         with STATE_LOCK:
@@ -604,6 +736,9 @@ class Master(pb_grpc.MasterServiceServicer):
             return pb.StatReply(status=st, data=pb.StatResponse(is_dir=False, mode=inode.mode, owner=inode.owner, size=total, chunk_count=len(inode.chunks)))
 
     def Rm(self, request, context):
+        status = _require_leader()
+        if status is not None:
+            return pb.RmReply(status=status, data=pb.RmResponse())
         user = _user_from_md(context)
         path = _norm(request.path)
         with STATE_LOCK:
@@ -643,6 +778,9 @@ class Master(pb_grpc.MasterServiceServicer):
         return pb.RmReply(status=st, data=pb.RmResponse())
 
     def Mv(self, request, context):
+        status = _require_leader()
+        if status is not None:
+            return pb.MvReply(status=status, data=pb.MvResponse())
         user = _user_from_md(context)
         src = _norm(request.src); dst = _norm(request.dst)
         with STATE_LOCK:
@@ -666,6 +804,9 @@ class Master(pb_grpc.MasterServiceServicer):
 
     # -------- Chunk ops --------
     def AssignChunk(self, request, context):
+        status = _require_leader()
+        if status is not None:
+            return pb.AssignChunkReply(status=status, data=pb.AssignChunkResponse())
         user = _user_from_md(context)
         path = _norm(request.path)
         idx = int(request.index)
@@ -722,6 +863,9 @@ class Master(pb_grpc.MasterServiceServicer):
         return pb.AssignChunkReply(status=st, data=pb.AssignChunkResponse(chunk_id=chunk_id, version=version, pipeline=pipeline))
 
     def CommitChunk(self, request, context):
+        status = _require_leader()
+        if status is not None:
+            return pb.CommitChunkReply(status=status, data=pb.CommitChunkResponse())
         user = _user_from_md(context)
         path = _norm(request.path)
         idx = int(request.index)
@@ -751,6 +895,9 @@ class Master(pb_grpc.MasterServiceServicer):
         return pb.CommitChunkReply(status=st, data=pb.CommitChunkResponse())
 
     def GetFilePlan(self, request, context):
+        status = _require_leader()
+        if status is not None:
+            return pb.GetFilePlanReply(status=status, data=pb.GetFilePlanResponse())
         user = _user_from_md(context)
         path = _norm(request.path)
         with STATE_LOCK:
@@ -778,17 +925,86 @@ class Master(pb_grpc.MasterServiceServicer):
         st, _ = _ok()
         return pb.GetFilePlanReply(status=st, data=pb.GetFilePlanResponse(size=total, chunks=plans))
 
+    def GetChunkLocation(self, request, context):
+        status = _require_leader()
+        if status is not None:
+            return pb.GetChunkLocationReply(status=status, data=pb.GetChunkLocationResponse())
+        user = _user_from_md(context)
+        path = _norm(request.path)
+        idx = int(request.index)
+        with STATE_LOCK:
+            inode = PATHS.get(path)
+            if not inode or inode.is_dir:
+                st, _ = _err("No such file")
+                return pb.GetChunkLocationReply(status=st, data=pb.GetChunkLocationResponse())
+            if not _can_read(user, inode):
+                st, _ = _err("PermissionDenied")
+                return pb.GetChunkLocationReply(status=st, data=pb.GetChunkLocationResponse())
+            cid = inode.chunks.get(idx)
+            if not cid:
+                st, _ = _err("No such chunk index")
+                return pb.GetChunkLocationReply(status=st, data=pb.GetChunkLocationResponse())
+            rec = CHUNKS.get(cid)
+            if not rec:
+                st, _ = _err("No such chunk")
+                return pb.GetChunkLocationReply(status=st, data=pb.GetChunkLocationResponse())
+            replicas = []
+            for node_id in list(rec.replicas):
+                ni = NODES.get(node_id)
+                if ni and ni.alive:
+                    replicas.append(pb.HostPort(host=ni.host, port=ni.data_port))
+            plan = pb.ChunkPlan(index=idx, chunk_id=cid, version=rec.version, size=rec.size, checksum=rec.checksum, replicas=replicas)
+        st, _ = _ok()
+        return pb.GetChunkLocationReply(status=st, data=pb.GetChunkLocationResponse(chunk=plan))
+
+    def RequestVote(self, request, context):
+        global CURRENT_TERM, VOTED_FOR, LAST_HEARTBEAT
+        term = int(request.term)
+        candidate_id = request.candidate_id
+        with ELECTION_LOCK:
+            if term < CURRENT_TERM:
+                return pb.RequestVoteResponse(term=CURRENT_TERM, vote_granted=False)
+            if term > CURRENT_TERM:
+                CURRENT_TERM = term
+                VOTED_FOR = None
+                _set_role("follower")
+            if VOTED_FOR is None or VOTED_FOR == candidate_id:
+                VOTED_FOR = candidate_id
+                LAST_HEARTBEAT = time.time()
+                return pb.RequestVoteResponse(term=CURRENT_TERM, vote_granted=True)
+            return pb.RequestVoteResponse(term=CURRENT_TERM, vote_granted=False)
+
+    def AppendEntries(self, request, context):
+        global CURRENT_TERM, LAST_HEARTBEAT, LEADER_EPOCH
+        term = int(request.term)
+        leader_id = request.leader_id
+        with ELECTION_LOCK:
+            if term < CURRENT_TERM:
+                return pb.AppendEntriesResponse(term=CURRENT_TERM, success=False)
+            CURRENT_TERM = term
+            LEADER_EPOCH = term
+            _set_role("follower")
+            _set_leader(leader_id)
+            LAST_HEARTBEAT = time.time()
+            return pb.AppendEntriesResponse(term=CURRENT_TERM, success=True)
+
 # -------------------------
 # Server main
 # -------------------------
 def serve():
     global LEADER_EPOCH
     recover()
-
-    LEADER_EPOCH = _acquire_leader_lock()
-    if not LEADER_EPOCH:
-        return
-    print("[MASTER] Acquired leader lock; starting service.", flush=True)
+    if not ELECTION_ENABLED:
+        LEADER_EPOCH = _acquire_leader_lock()
+        if not LEADER_EPOCH:
+            return
+        _set_role("leader")
+        _set_leader(MASTER_ID)
+        print("[MASTER] Acquired leader lock; starting service.", flush=True)
+    else:
+        _set_role("follower")
+        _set_leader(None)
+        print("[MASTER] Leader election enabled; starting service as follower.", flush=True)
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=32))
     pb_grpc.add_MasterServiceServicer_to_server(Master(), server)
@@ -807,9 +1023,13 @@ def serve():
     # background workers (after bind succeeds)
     threading.Thread(target=_repair_loop, daemon=True).start()
     threading.Thread(target=_gc_loop, daemon=True).start()
+    if ELECTION_ENABLED:
+        threading.Thread(target=_heartbeat_loop, daemon=True).start()
+        threading.Thread(target=_election_loop, daemon=True).start()
 
     server.start()
-    print(f"[MASTER] LEADER listening on {MASTER_HOST}:{MASTER_PORT} RF={RF} epoch={LEADER_EPOCH}", flush=True)
+    role_label = ROLE.upper()
+    print(f"[MASTER] {role_label} listening on {MASTER_HOST}:{MASTER_PORT} RF={RF} epoch={LEADER_EPOCH}", flush=True)
 
     try:
         while not STOP.is_set():
@@ -817,8 +1037,8 @@ def serve():
     finally:
         STOP.set()
         server.stop(0)
-        _release_leader_lock()
+        if not ELECTION_ENABLED:
+            _release_leader_lock()
 
 if __name__ == "__main__":
     serve()
-
