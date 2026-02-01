@@ -1,394 +1,306 @@
+# client.py - DistriFS CLI client
+from __future__ import annotations
+
 import os
 import sys
 import time
-import math
 import socket
-import zlib
-from typing import Dict, Tuple, Optional, List, Any
+from typing import List, Tuple, Optional
 
 import grpc
 
-from utils import send_msg, recv_msg, recv_exact, ensure_proto_generated
+from utils import ensure_proto_generated, send_msg, recv_msg, recv_exact
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-os.chdir(BASE_DIR)
-if BASE_DIR not in sys.path:
-    sys.path.insert(0, BASE_DIR)
-    # Prevent importing stale grpc stubs from user site-packages
-os.environ.setdefault("PYTHONNOUSERSITE", "1")
+ensure_proto_generated(force=bool(os.getenv("DISTRIFS_FORCE_PROTO")))
 
-# If grpc stubs are stale/mismatched, gRPC will return UNIMPLEMENTED (server-side).
-# Force regeneration when GetFilePlan is missing.
-try:
-    if os.path.exists("distrifs_pb2_grpc.py"):
-        with open("distrifs_pb2_grpc.py", "r", encoding="utf-8", errors="ignore") as f:
-            txt = f.read()
-        if "GetFilePlan" not in txt:
-            for p in ("distrifs_pb2.py", "distrifs_pb2_grpc.py"):
-                try:
-                    os.remove(p)
-                except FileNotFoundError:
-                    pass
-except Exception:
-    pass
-
-ensure_proto_generated()
 import distrifs_pb2 as pb
 import distrifs_pb2_grpc as pb_grpc
-
 
 MASTER_HOST = os.getenv("DISTRIFS_MASTER_HOST", "127.0.0.1")
 MASTER_PORT = int(os.getenv("DISTRIFS_MASTER_PORT", "9000"))
 USER = os.getenv("DISTRIFS_USER", "user")
 
-# Spec default 64MB; override for tests/demos.
-CHUNK_SIZE = int(os.getenv("DISTRIFS_CHUNK_SIZE", str(64 * 1024 * 1024)))
-REPLICATION_FACTOR = int(os.getenv("DISTRIFS_REPLICATION_FACTOR", "3"))
+CHUNK_SIZE = int(os.getenv("DISTRIFS_CHUNK_SIZE", str(256 * 1024)))
 
-SOCKET_TIMEOUT = int(os.getenv("DISTRIFS_SOCKET_TIMEOUT", "12"))
-RETRY_LIMIT = int(os.getenv("DISTRIFS_CLIENT_RETRY", "5"))
-
-# metadata cache (read optimization)
-CACHE_TTL = int(os.getenv("DISTRIFS_CACHE_TTL", "10"))
-_chunk_cache: Dict[str, Tuple[float, List[pb.Endpoint], int, int, int]] = {}  # chunk_id -> (ts, replicas, version, checksum, size)
-
+def _stub():
+    ch = grpc.insecure_channel(f"{MASTER_HOST}:{MASTER_PORT}")
+    return pb_grpc.MasterServiceStub(ch)
 
 def _md():
     return (("x-user", USER),)
 
+def _die(msg: str, code: int = 2):
+    print(msg, file=sys.stderr, flush=True)
+    raise SystemExit(code)
 
-def master_stub() -> pb_grpc.MasterServiceStub:
-    ch = grpc.insecure_channel(f"{MASTER_HOST}:{MASTER_PORT}")
-    return pb_grpc.MasterServiceStub(ch)
+# -------------------------
+# Namespace commands
+# -------------------------
+def mkdir(remote_dir: str, mode: int = 0o700):
+    stub = _stub()
+    r = stub.Mkdir(pb.MkdirRequest(path=remote_dir, mode=mode), timeout=6.0, metadata=_md())
+    if not r.status.ok:
+        _die(r.status.error.message if r.status.error else "mkdir failed")
 
+def ls(remote_dir: str):
+    stub = _stub()
+    r = stub.Ls(pb.LsRequest(path=remote_dir), timeout=6.0, metadata=_md())
+    if not r.status.ok:
+        _die(r.status.error.message if r.status.error else "ls failed")
+    for e in r.data.entries:
+        print(e)
 
-def _connect(ep: pb.Endpoint) -> socket.socket:
-    s = socket.create_connection((ep.host, int(ep.port)), timeout=SOCKET_TIMEOUT)
-    s.settimeout(SOCKET_TIMEOUT)
-    return s
+def stat(path: str):
+    stub = _stub()
+    r = stub.Stat(pb.StatRequest(path=path), timeout=6.0, metadata=_md())
+    if not r.status.ok:
+        _die(r.status.error.message if r.status.error else "stat failed")
+    d = r.data
+    kind = "dir" if d.is_dir else "file"
+    print(f"{kind} owner={d.owner} mode={oct(d.mode)} size={d.size} chunks={d.chunk_count}")
 
+def rm(path: str, recursive: bool = False):
+    stub = _stub()
+    r = stub.Rm(pb.RmRequest(path=path, recursive=recursive), timeout=6.0, metadata=_md())
+    if not r.status.ok:
+        _die(r.status.error.message if r.status.error else "rm failed")
 
-def mkdir(path: str, owner: str = USER, mode: int = 0o755) -> None:
-    master_stub().Mkdir(pb.MkdirRequest(path=path, owner=owner, mode=int(mode)), timeout=6.0, metadata=_md())
+def mv(src: str, dst: str):
+    stub = _stub()
+    r = stub.Mv(pb.MvRequest(src=src, dst=dst), timeout=6.0, metadata=_md())
+    if not r.status.ok:
+        _die(r.status.error.message if r.status.error else "mv failed")
 
-
-def listdir(path: str):
-    resp = master_stub().ListDir(pb.ListDirRequest(path=path), timeout=6.0, metadata=_md())
-    return list(resp.dirs), list(resp.files)
-
-
-def stat(path: str) -> Dict[str, Any]:
-    resp = master_stub().Stat(pb.StatRequest(path=path), timeout=6.0, metadata=_md())
-    return {"type": resp.type, "mode": resp.mode, "chunks": resp.chunks, "size": resp.size, "owner": resp.owner}
-
-
-def delete_path(path: str) -> None:
-    master_stub().DeletePath(pb.DeletePathRequest(path=path), timeout=10.0, metadata=_md())
-
-
-def rename_path(src: str, dst: str) -> None:
-    master_stub().RenamePath(pb.RenamePathRequest(src=src, dst=dst), timeout=10.0, metadata=_md())
-
-
-def assign_chunk(path: str, idx: int) -> pb.AssignChunkResponse:
-    return master_stub().AssignChunk(pb.AssignChunkRequest(path=path, index=int(idx)), timeout=10.0, metadata=_md())
-
-
-def commit_chunk(path: str, idx: int, chunk_id: str, version: int, checksum: int, size: int, node_ids: List[str]) -> None:
-    master_stub().CommitChunk(pb.CommitChunkRequest(
-        path=path,
-        index=int(idx),
-        chunk_id=chunk_id,
-        version=int(version),
-        checksum=int(checksum),
-        size=int(size),
-        node_ids=node_ids,
-    ), timeout=10.0, metadata=_md())
-
-
-def get_file_plan(path: str) -> pb.GetFilePlanResponse:
-    return master_stub().GetFilePlan(pb.GetFilePlanRequest(path=path), timeout=10.0, metadata=_md())
-
-
-def _store_stream_from_file(pipeline: List[pb.Endpoint], chunk_id: str, version: int, f, size: int) -> Dict[str, Any]:
+# -------------------------
+# Data-plane I/O
+# -------------------------
+def _put_to_pipeline(pipeline: List[pb.HostPort], chunk_id: str, version: int, data: bytes) -> int:
     if not pipeline:
-        raise RuntimeError("No pipeline from master")
-    if len(pipeline) < REPLICATION_FACTOR:
-        raise RuntimeError("CP write denied: replication factor not satisfiable")
+        raise RuntimeError("empty pipeline")
+    first = pipeline[0]
+    forward = [(hp.host, int(hp.port)) for hp in pipeline[1:]]
+    hdr = {"op": "PUT", "chunk_id": chunk_id, "version": int(version), "size": len(data), "forward_to": forward}
+    sock = socket.create_connection((first.host, int(first.port)), timeout=8.0)
+    send_msg(sock, hdr)
+    # stream bytes
+    mv = memoryview(data)
+    off = 0
+    while off < len(data):
+        n = 256 * 1024
+        sock.sendall(mv[off:off+n])
+        off += n
+    ack = recv_msg(sock)
+    sock.close()
+    if not ack.get("ok", False):
+        raise RuntimeError(ack.get("err", "put failed"))
+    return int(ack.get("checksum", 0))
 
-    replicate_to = [(ep.host, int(ep.port)) for ep in pipeline[1:]]
-    head = pipeline[0]
-
-    with _connect(head) as s:
-        send_msg(s, {
-            "op": "STORE_STREAM",
-            "chunk_id": chunk_id,
-            "version": int(version),
-            "size": int(size),
-            "replicate_to": replicate_to,
-        })
-
-        remaining = size
-        while remaining > 0:
-            buf = f.read(min(65536, remaining))
-            if not buf:
-                raise RuntimeError("Unexpected EOF while streaming upload chunk")
-            s.sendall(buf)
-            remaining -= len(buf)
-
-        resp = recv_msg(s)
-        if resp.get("status") != "ok":
-            raise RuntimeError(resp.get("error", "store_failed"))
-
-        meta = resp.get("meta", {})
-        acked_nodes = list(resp.get("acked_nodes", []))
-        if len(acked_nodes) < REPLICATION_FACTOR:
-            raise RuntimeError("Write failed: pipeline did not satisfy replication factor")
-
-        return {
-            "checksum": int(meta.get("checksum", 0)),
-            "size": int(meta.get("size", size)),
-            "version": int(meta.get("version", version)),
-            "node_ids": acked_nodes,
-        }
-
+def _get_from_replica(host: str, port: int, chunk_id: str, version: int) -> bytes:
+    sock = socket.create_connection((host, int(port)), timeout=8.0)
+    send_msg(sock, {"op": "GET", "chunk_id": chunk_id, "version": int(version)})
+    hdr = recv_msg(sock)
+    if not hdr.get("ok", False):
+        sock.close()
+        raise RuntimeError(hdr.get("err", "get failed"))
+    size = int(hdr["size"])
+    data = recv_exact(sock, size) if size > 0 else b""
+    sock.close()
+    return data
 
 def upload_file(local_path: str, remote_path: str) -> None:
-    total = os.path.getsize(local_path)
-    n_chunks = int(math.ceil(total / float(CHUNK_SIZE))) if total else 1
-    print(f"[CLIENT] PUT {local_path} -> {remote_path} bytes={total} chunks={n_chunks} chunk_size={CHUNK_SIZE}")
+    local_path = str(local_path)
+    st = os.stat(local_path)
+    total = int(st.st_size)
+    total_chunks = max(1, math.ceil(total / CHUNK_SIZE))
+
+    rf = int(os.getenv("DISTRIFS_RF", "3"))
+
+    print(
+        f"[CLIENT] PUT {local_path} -> {remote_path} bytes={total} chunks={total_chunks} chunk_size={CHUNK_SIZE}",
+        flush=True,
+    )
 
     with open(local_path, "rb") as f:
-        for idx in range(n_chunks):
-            # compute this chunk size without reading entire file
-            remaining_total = total - idx * CHUNK_SIZE
-            csize = CHUNK_SIZE if remaining_total > CHUNK_SIZE else max(0, remaining_total)
+        for idx in range(total_chunks):
+            buf = f.read(CHUNK_SIZE) or b""
 
-            if total == 0:
-                csize = 0
-
-            last_err: Optional[Exception] = None
-            for attempt in range(RETRY_LIMIT):
+            # Wait up to 15s for enough active DataNodes (master enforces CP)
+            deadline = time.time() + 15.0
+            last_err = None
+            while True:
                 try:
-                    plan = assign_chunk(remote_path, idx)
-                    # stream exactly csize bytes from current position
-                    pos_before = f.tell()
-                    try:
-                        res = _store_stream_from_file(list(plan.pipeline), plan.chunk_id, int(plan.version), f, int(csize))
-                    except Exception:
-                        # rewind for retry
-                        f.seek(pos_before, os.SEEK_SET)
-                        raise
+                    assign = assign_chunk(remote_path, idx)
+                    break
+                except grpc.RpcError as e:
+                    last_err = e
+                    if (
+                        e.code() in (grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.UNAVAILABLE)
+                        and time.time() < deadline
+                    ):
+                        time.sleep(0.5)
+                        continue
+                    raise
 
-                    commit_chunk(remote_path, idx, plan.chunk_id, int(res["version"]), int(res["checksum"]), int(res["size"]), node_ids=list(res["node_ids"]))
+            if len(assign.pipeline) < rf:
+                raise RuntimeError(
+                    f"CP write denied: replication factor not satisfiable (need {rf} active DataNodes). last={last_err}"
+                )
+
+            node_ids = store_to_pipeline(assign.chunk_id, int(assign.version), buf, list(assign.pipeline))
+            crc = zlib.crc32(buf) & 0xFFFFFFFF
+            commit_chunk(remote_path, idx, assign.chunk_id, int(assign.version), crc, len(buf), node_ids)
+
+    print("[CLIENT] PUT complete.", flush=True)
+
+# -------------------------
+# High-level file ops
+# -------------------------
+def put(local_path: str, remote_path: str):
+    p = os.path.abspath(local_path)
+    if not os.path.exists(p):
+        _die(f"Local file missing: {p}")
+    total = os.path.getsize(p)
+    print(f"[CLIENT] PUT {p} -> {remote_path} bytes={total} chunks={max(1,(total + CHUNK_SIZE - 1)//CHUNK_SIZE)} chunk_size={CHUNK_SIZE}", flush=True)
+
+    stub = _stub()
+    with open(p, "rb") as f:
+        idx = 0
+        while True:
+            data = f.read(CHUNK_SIZE)
+            if not data:
+                break
+            last_err = None
+            for attempt in range(3):
+                try:
+                    ar = stub.AssignChunk(pb.AssignChunkRequest(path=remote_path, index=idx, max_size=CHUNK_SIZE), timeout=6.0, metadata=_md())
+                    if not ar.status.ok:
+                        raise RuntimeError(ar.status.error.message if ar.status.error else "assign failed")
+                    chunk_id = ar.data.chunk_id
+                    version = int(ar.data.version)
+                    pipeline = list(ar.data.pipeline)
+                    checksum = _put_to_pipeline(pipeline, chunk_id, version, data)
+                    cr = stub.CommitChunk(pb.CommitChunkRequest(
+                        path=remote_path, index=idx, chunk_id=chunk_id, version=version,
+                        size=len(data), checksum=checksum, pipeline=pipeline
+                    ), timeout=6.0, metadata=_md())
+                    if not cr.status.ok:
+                        raise RuntimeError(cr.status.error.message if cr.status.error else "commit failed")
                     last_err = None
                     break
                 except Exception as e:
                     last_err = e
-                    # backoff + retry with replan
-                    time.sleep(min(0.25 * (attempt + 1), 1.0))
-
+                    time.sleep(0.2 * (attempt + 1))
             if last_err is not None:
                 raise RuntimeError(f"Failed PUT chunk idx={idx}: {last_err}")
+            idx += 1
+    print("[CLIENT] PUT complete.", flush=True)
 
-    print("[CLIENT] PUT complete.")
+def get(remote_path: str, out_path: str):
+    stub = _stub()
+    r = stub.GetFilePlan(pb.GetFilePlanRequest(path=remote_path), timeout=6.0, metadata=_md())
+    if not r.status.ok:
+        _die(r.status.error.message if r.status.error else "GetFilePlan failed")
+    plan = r.data
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
-
-def _cache_put(chunk_id: str, replicas: List[pb.Endpoint], version: int, checksum: int, size: int) -> None:
-    _chunk_cache[chunk_id] = (time.time(), list(replicas), int(version), int(checksum), int(size))
-
-
-def _try_read_replica(ep: pb.Endpoint, chunk_id: str) -> bytes:
-    with _connect(ep) as s:
-        send_msg(s, {"op": "READ", "chunk_id": chunk_id})
-        hdr = recv_msg(s)
-        if hdr.get("status") != "ok":
-            code = hdr.get("code", "ERR")
-            raise RuntimeError(f"{code}: {hdr.get('error', 'read_failed')}")
-        size = int(hdr["size"])
-        expected = int(hdr.get("checksum", 0))
-        payload = recv_exact(s, size)
-
-        actual = zlib.crc32(payload) & 0xFFFFFFFF
-        if expected and actual != expected:
-            raise RuntimeError(f"CORRUPT: expected {expected}, got {actual}")
-        return payload
-
-
-
-def download_file(remote_path: str, out_path: str) -> None:
-    def _get_plan_nonempty(timeout_s: float = 10.0) -> pb.GetFilePlanResponse:
-        deadline = time.time() + timeout_s
-        last_err = None
-        while time.time() < deadline:
-            try:
-                plan = get_file_plan(remote_path)
-                if getattr(plan, "chunks", None) and len(plan.chunks) > 0:
-                    return plan
-            except Exception as e:
-                last_err = e
-            time.sleep(0.25)
-        raise RuntimeError(f"GetFilePlan returned empty for too long. last={last_err}")
-
-    plan = _get_plan_nonempty(timeout_s=12.0)
-    expected_total = sum(int(fc.size) for fc in plan.chunks)
-
-    parts: Dict[int, bytes] = {}
-
-    for fc in plan.chunks:
-        # Wait until replicas appear (volatile mapping)
-        replicas = list(fc.replicas)
-        if not replicas:
-            deadline = time.time() + 12.0
-            while time.time() < deadline:
+    with open(out_path, "wb") as out:
+        for cp in plan.chunks:
+            if not cp.replicas:
+                raise RuntimeError(f"No replicas for chunk {cp.chunk_id}")
+            last = None
+            for hp in cp.replicas:
                 try:
-                    plan2 = get_file_plan(remote_path)
-                    match = None
-                    for c2 in plan2.chunks:
-                        if c2.chunk_id == fc.chunk_id:
-                            match = c2
-                            break
-                    if match is not None and len(match.replicas) > 0:
-                        replicas = list(match.replicas)
-                        break
-                except Exception:
-                    pass
-                time.sleep(0.25)
+                    data = _get_from_replica(hp.host, int(hp.port), cp.chunk_id, int(cp.version))
+                    # size sanity
+                    if len(data) != int(cp.size):
+                        raise RuntimeError("short read")
+                    out.write(data)
+                    last = None
+                    break
+                except Exception as e:
+                    last = e
+            if last is not None:
+                raise RuntimeError(f"Chunk read failed: {cp.chunk_id}: {last}")
+    print(f"[CLIENT] GET {remote_path} -> {out_path} bytes={plan.size}", flush=True)
 
-        if not replicas:
-            raise RuntimeError(f"No replicas for chunk {fc.chunk_id} (mapping not rebuilt yet)")
-
-        last_err: Optional[Exception] = None
-        ok = False
-        for attempt in range(min(RETRY_LIMIT, len(replicas))):
-            try:
-                blob = _try_read_replica(replicas[attempt], fc.chunk_id)
-                parts[int(fc.index)] = blob
-                ok = True
+def getrange(remote_path: str, offset: int, length: int, out_path: str):
+    stub = _stub()
+    r = stub.GetFilePlan(pb.GetFilePlanRequest(path=remote_path), timeout=6.0, metadata=_md())
+    if not r.status.ok:
+        _die(r.status.error.message if r.status.error else "GetFilePlan failed")
+    plan = r.data
+    # compute which chunks to fetch
+    remaining = length
+    cur_off = 0
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    with open(out_path, "wb") as out:
+        for cp in plan.chunks:
+            if remaining <= 0:
                 break
-            except Exception as e:
-                last_err = e
-
-        if not ok:
-            raise RuntimeError(f"Failed to read chunk {fc.chunk_id}: {last_err}")
-
-    out = b"".join(parts[i] for i in sorted(parts.keys()))
-
-    # Hard safety check: never silently write an empty file for a non-empty input
-    if expected_total > 0 and len(out) == 0:
-        raise RuntimeError("Download produced 0 bytes but expected non-zero (plan/chunk fetch bug).")
-
-    if expected_total and len(out) != expected_total:
-        raise RuntimeError(f"Download size mismatch: got={len(out)} expected={expected_total}")
-
-    tmp = out_path + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(out)
-    os.replace(tmp, out_path)
-
-    print(f"[CLIENT] GET {remote_path} -> {out_path} bytes={len(out)}")
-
-
-
-def read_range(remote_path: str, offset: int, length: int) -> bytes:
-    """
-    Chunking calculator requirement: map byte offsets -> chunk index + local offsets.
-    Uses committed chunk sizes from master metadata.
-    """
-    plan = None
-    last = None
-    for i in range(RETRY_LIMIT):
-        try:
-            plan = get_file_plan(remote_path)
-            break
-        except Exception as e:
-            last = e
-            time.sleep(min(0.4 * (i + 1), 1.5))
-    if plan is None:
-        raise RuntimeError(f"GetFilePlan failed: {last}")
-
-    ordered = sorted(plan.chunks, key=lambda c: c.index)
-
-    starts: List[int] = []
-    pos = 0
-    for c in ordered:
-        starts.append(pos)
-        pos += int(c.size)
-
-    end_off = offset + length
-    out = bytearray()
-
-    for i, c in enumerate(ordered):
-        c_start = starts[i]
-        c_end = c_start + int(c.size)
-        if c_end <= offset:
-            continue
-        if c_start >= end_off:
-            break
-
-        replicas = list(c.replicas)
-        blob = None
-        for attempt in range(min(RETRY_LIMIT, len(replicas))):
-            try:
-                blob = _try_read_replica(replicas[attempt], c.chunk_id)
-                break
-            except Exception:
+            chunk_start = cur_off
+            chunk_end = cur_off + int(cp.size)
+            cur_off = chunk_end
+            if chunk_end <= offset:
                 continue
-        if blob is None:
-            raise RuntimeError(f"Failed to read chunk for range: {c.chunk_id}")
+            # need this chunk
+            last = None
+            data = None
+            for hp in cp.replicas:
+                try:
+                    data = _get_from_replica(hp.host, int(hp.port), cp.chunk_id, int(cp.version))
+                    last = None
+                    break
+                except Exception as e:
+                    last = e
+            if last is not None or data is None:
+                raise RuntimeError(f"Chunk read failed: {cp.chunk_id}: {last}")
+            # slice
+            s = max(0, offset - chunk_start)
+            e = min(int(cp.size), s + remaining)
+            out.write(data[s:e])
+            remaining -= (e - s)
+    print(f"[CLIENT] GETRANGE {remote_path} offset={offset} length={length} -> {out_path}", flush=True)
 
-        lo = max(0, offset - c_start)
-        hi = min(int(c.size), end_off - c_start)
-        out.extend(blob[lo:hi])
+def usage():
+    print("Usage:\n"
+          "  python client.py mkdir <remote_dir>\n"
+          "  python client.py ls <remote_dir>\n"
+          "  python client.py stat <path>\n"
+          "  python client.py put <local_path> <remote_path>\n"
+          "  python client.py get <remote_path> <out_path>\n"
+          "  python client.py getrange <remote_path> <offset> <length> <out_path>\n"
+          "  python client.py rm <path>\n"
+          "  python client.py mv <src> <dst>\n", flush=True)
 
-    return bytes(out)
-
-
-def main() -> None:
+def main():
     if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python client.py mkdir <remote_dir>")
-        print("  python client.py ls <remote_dir>")
-        print("  python client.py stat <path>")
-        print("  python client.py put <local_path> <remote_path>")
-        print("  python client.py get <remote_path> <out_path>")
-        print("  python client.py getrange <remote_path> <offset> <length> <out_path>")
-        print("  python client.py rm <path>")
-        print("  python client.py mv <src> <dst>")
-        sys.exit(1)
-
-    cmd = sys.argv[1].lower()
-    if cmd == "mkdir":
-        mkdir(sys.argv[2])
-        print("OK")
-    elif cmd == "ls":
-        d, f = listdir(sys.argv[2])
-        print("dirs:", d)
-        print("files:", f)
-    elif cmd == "stat":
-        print(stat(sys.argv[2]))
-    elif cmd == "put":
-        upload_file(sys.argv[2], sys.argv[3])
-    elif cmd == "get":
-        download_file(sys.argv[2], sys.argv[3])
-    elif cmd == "getrange":
-        rp = sys.argv[2]
-        off = int(sys.argv[3])
-        ln = int(sys.argv[4])
-        outp = sys.argv[5]
-        data = read_range(rp, off, ln)
-        with open(outp, "wb") as f:
-            f.write(data)
-        print(f"[CLIENT] GETRANGE wrote {len(data)} bytes to {outp}")
-    elif cmd == "rm":
-        delete_path(sys.argv[2])
-        print("OK")
-    elif cmd == "mv":
-        rename_path(sys.argv[2], sys.argv[3])
-        print("OK")
-    else:
-        raise SystemExit(f"Unknown command: {cmd}")
-
+        usage()
+        return
+    cmd = sys.argv[1]
+    try:
+        if cmd == "mkdir" and len(sys.argv) == 3:
+            mkdir(sys.argv[2])
+        elif cmd == "ls" and len(sys.argv) == 3:
+            ls(sys.argv[2])
+        elif cmd == "stat" and len(sys.argv) == 3:
+            stat(sys.argv[2])
+        elif cmd == "put" and len(sys.argv) == 4:
+            put(sys.argv[2], sys.argv[3])
+        elif cmd == "get" and len(sys.argv) == 4:
+            get(sys.argv[2], sys.argv[3])
+        elif cmd == "getrange" and len(sys.argv) == 6:
+            getrange(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5])
+        elif cmd == "rm" and len(sys.argv) == 3:
+            rm(sys.argv[2], recursive=False)
+        elif cmd == "mv" and len(sys.argv) == 4:
+            mv(sys.argv[2], sys.argv[3])
+        else:
+            usage()
+            raise SystemExit(2)
+    except SystemExit:
+        raise
+    except Exception as e:
+        _die(str(e), code=1)
 
 if __name__ == "__main__":
     main()

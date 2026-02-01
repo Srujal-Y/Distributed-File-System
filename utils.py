@@ -1,32 +1,31 @@
-# utils.py
+# utils.py - shared helpers for DistriFS
+from __future__ import annotations
+
 import os
-import sys
 import struct
 import pickle
 import tempfile
 import threading
 import socket
-from typing import Any, Dict, Tuple
+import hashlib
+from typing import Any, Dict, Iterator, Tuple, Optional
 
+# -------------------------
+# WAL helpers (Master)
+# -------------------------
 WAL_LOCK = threading.Lock()
 
-# WAL format: [OP_CODE (1 byte)][LEN (4 bytes)][PAYLOAD (LEN bytes)]
+# WAL format: [OP_CODE (1 byte)][LEN (4 bytes)][PAYLOAD (LEN bytes, pickle)]
 def wal_append(path: str, op_code: int, payload: Dict[str, Any]) -> None:
     blob = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
     rec = struct.pack("!BI", op_code & 0xFF, len(blob)) + blob
     with WAL_LOCK:
-        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
         with open(path, "ab") as f:
             f.write(rec)
             f.flush()
             os.fsync(f.fileno())
 
-def wal_iter(path: str):
-    """
-    Robust WAL iterator:
-    - Stops cleanly on partial tail records (common after kill -9 / power loss).
-    - Skips corrupted entries instead of crashing the Master.
-    """
+def wal_iter(path: str) -> Iterator[Tuple[int, Dict[str, Any]]]:
     if not os.path.exists(path):
         return
     with open(path, "rb") as f:
@@ -39,16 +38,16 @@ def wal_iter(path: str):
             op, n = struct.unpack("!BI", hdr)
             payload = f.read(n)
             if len(payload) != n:
-                # Partial tail write -> stop replay
                 break
             try:
                 yield op, pickle.loads(payload)
             except Exception:
-                # Corrupt entry -> skip and continue
-                continue
+                break
 
-# TCP framed messages for small control headers on data plane
-# msg := [len:4 big-endian][pickle]
+# -------------------------
+# TCP framed messages (Data plane control headers + acks)
+# -------------------------
+# msg := [len:4 big-endian][pickle-bytes]
 def send_msg(sock: socket.socket, obj: Any) -> None:
     data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     sock.sendall(struct.pack("!I", len(data)) + data)
@@ -68,8 +67,10 @@ def recv_msg(sock: socket.socket) -> Any:
     data = recv_exact(sock, n)
     return pickle.loads(data)
 
+# -------------------------
+# Filesystem helpers
+# -------------------------
 def atomic_write(path: str, data: bytes) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:
         f.write(data)
@@ -77,115 +78,75 @@ def atomic_write(path: str, data: bytes) -> None:
         os.fsync(f.fileno())
     os.replace(tmp, path)
 
-def ensure_dir(path: str) -> None:
-    if not path:
-        return
-    os.makedirs(path, exist_ok=True)
-
 def storage_root() -> str:
-    # Spec says /tmp/distrifs/data. On Windows, tempfile.gettempdir() is equivalent.
     base = "/tmp" if os.name != "nt" else tempfile.gettempdir()
     return os.path.join(base, "distrifs", "data")
 
-# -----------------------------
-# Protobuf generation (HARDENED)
-# -----------------------------
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(1024 * 1024)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+# -------------------------
+# Protobuf generation
+# -------------------------
 _PROTO_ONCE = threading.Lock()
 
-_REQUIRED_RPC_MARKERS = (
-    "rpc GetFilePlan",
-    "rpc AssignChunk",
-    "rpc CommitChunk",
-    "service MasterService",
-)
+def _proto_path() -> str:
+    # Prefer explicit env var path
+    p = os.getenv("DISTRIFS_PROTO_PATH")
+    if p and os.path.exists(p):
+        return os.path.abspath(p)
+    # Fallback to local file in cwd
+    if os.path.exists("distrifs.proto"):
+        return os.path.abspath("distrifs.proto")
+    raise RuntimeError("Cannot find distrifs.proto. Set DISTRIFS_PROTO_PATH or place distrifs.proto in project root.")
 
-def _file_contains(path: str, needles: Tuple[str, ...]) -> bool:
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            s = f.read()
-        return all(n in s for n in needles)
-    except Exception:
-        return False
-
-def ensure_proto_generated() -> None:
+def ensure_proto_generated(force: bool = False) -> None:
     """
-    Deterministic proto generation:
-    - Always uses the directory where utils.py lives (NOT the current working directory).
-    - Regenerates if:
-        * pb2/pb2_grpc missing
-        * pb2_grpc is stale or missing required RPC symbols (fixes UNIMPLEMENTED)
-        * proto is newer than generated files
-        * user sets DISTRIFS_FORCE_PROTO=1
+    Generate distrifs_pb2.py / distrifs_pb2_grpc.py in the current working directory.
+    Safe to call from all entrypoints.
     """
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-
-    proto_path = os.path.join(base_dir, "distrifs.proto")
-    pb2_path = os.path.join(base_dir, "distrifs_pb2.py")
-    pb2g_path = os.path.join(base_dir, "distrifs_pb2_grpc.py")
-
-    # Make sure imports resolve to THIS directory first
-    if base_dir not in sys.path:
-        sys.path.insert(0, base_dir)
-
-    force = os.getenv("DISTRIFS_FORCE_PROTO", "").strip() == "1"
-
     with _PROTO_ONCE:
-        if not os.path.exists(proto_path):
-            raise RuntimeError(f"Missing distrifs.proto at: {proto_path}")
-
-        # If proto itself is missing required RPCs, that's a project-state error.
-        # But we still fail fast with a clear message.
-        if not _file_contains(proto_path, _REQUIRED_RPC_MARKERS):
-            raise RuntimeError(
-                "Your distrifs.proto is missing required RPC definitions "
-                "(GetFilePlan / AssignChunk / CommitChunk / MasterService). "
-                "Fix distrifs.proto to match the project spec, then rerun."
-            )
-
-        def mtime(p: str) -> float:
-            try:
-                return os.path.getmtime(p)
-            except Exception:
-                return 0.0
-
-        missing = (not os.path.exists(pb2_path)) or (not os.path.exists(pb2g_path))
-
-        # If pb2_grpc exists but doesn't include GetFilePlan, server will return UNIMPLEMENTED.
-        grpc_missing_symbols = (not os.path.exists(pb2g_path)) or (not _file_contains(pb2g_path, ("GetFilePlan", "MasterServiceStub")))
-
-        # If proto changed after generated code, regenerate.
-        stale = mtime(proto_path) > max(mtime(pb2_path), mtime(pb2g_path))
-
-        if (not force) and (not missing) and (not grpc_missing_symbols) and (not stale):
+        if (not force) and os.path.exists("distrifs_pb2.py") and os.path.exists("distrifs_pb2_grpc.py"):
             return
-
-        # Delete old generated files
-        for p in (pb2_path, pb2g_path):
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
-
         try:
             from grpc_tools import protoc
         except Exception as e:
-            raise RuntimeError("grpcio-tools not installed. Run: pip install grpcio-tools") from e
+            raise RuntimeError("grpcio-tools not installed. Run: pip install grpcio grpcio-tools protobuf") from e
 
-        # Run protoc in base_dir so -I and relative path are always correct
+        proto = _proto_path()
+        proto_dir = os.path.dirname(proto)
+        proto_file = os.path.basename(proto)
+
         args = [
             "protoc",
-            f"-I{base_dir}",
-            f"--python_out={base_dir}",
-            f"--grpc_python_out={base_dir}",
-            os.path.basename(proto_path),
+            f"-I{proto_dir}",
+            "--python_out=.",
+            "--grpc_python_out=.",
+            proto_file,
         ]
-
-        cwd = os.getcwd()
+        # protoc runs from cwd; set cwd to proto_dir by temporarily chdir
+        old = os.getcwd()
         try:
-            os.chdir(base_dir)
-            rc = protoc.main(args)
-            if rc != 0:
-                raise RuntimeError(f"protoc failed with exit code {rc}")
+            os.chdir(proto_dir)
+            code = protoc.main(args)
         finally:
-            os.chdir(cwd)
+            os.chdir(old)
+        if code != 0:
+            raise RuntimeError(f"protoc failed with exit code {code}")
+
+# -------------------------
+# Master epoch helpers (fencing)
+# -------------------------
+def read_master_epoch(epoch_path: str = "master.epoch") -> int:
+    try:
+        with open(epoch_path, "r", encoding="utf-8") as f:
+            return int(f.read().strip() or "0")
+    except Exception:
+        return 0

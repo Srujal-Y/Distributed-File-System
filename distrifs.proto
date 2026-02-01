@@ -1,106 +1,156 @@
 syntax = "proto3";
 package distrifs;
 
-message Empty {}
-
-message Endpoint {
+// ---------- Common ----------
+message HostPort {
   string host = 1;
   int32 port = 2;
 }
 
-message RegisterRequest {
-  int32 data_port = 1;
-  int32 control_port = 2;
+message Error {
+  string message = 1;
 }
-message RegisterResponse { string node_id = 1; }
 
-message HeartbeatRequest { string node_id = 1; }
-
-message ChunkVersion {
-  string chunk_id = 1;
-  int32 version = 2;
+message Status {
+  bool ok = 1;
+  Error error = 2;
 }
+
+// ---------- DataNode -> Master (health, inventory) ----------
+message RegisterDataNodeRequest {
+  string host = 1;
+  int32 data_port = 2;
+  int32 control_port = 3;
+}
+
+message RegisterDataNodeResponse {
+  string node_id = 1;
+  int64 epoch = 2;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  int64 epoch = 2;
+}
+
+message HeartbeatResponse {}
+
 message BlockReportRequest {
   string node_id = 1;
-  repeated ChunkVersion chunks = 2;
+  int64 epoch = 2;
+  // chunk_id -> version
+  map<string, int32> chunks = 3;
 }
 
-message MkdirRequest {
-  string path = 1;
-  string owner = 2;
-  int32 mode = 3;
-}
+message BlockReportResponse {}
 
-message ListDirRequest { string path = 1; }
-message ListDirResponse {
-  repeated string dirs = 1;
-  repeated string files = 2;
-}
+message RegisterDataNodeReply { Status status = 1; RegisterDataNodeResponse data = 2; }
+message HeartbeatReply { Status status = 1; HeartbeatResponse data = 2; }
+message BlockReportReply { Status status = 1; BlockReportResponse data = 2; }
+
+// ---------- Client -> Master (namespace + planning) ----------
+message MkdirRequest { string path = 1; int32 mode = 2; }
+message MkdirResponse {}
+message MkdirReply { Status status = 1; MkdirResponse data = 2; }
+
+message LsRequest { string path = 1; }
+message LsResponse { repeated string entries = 1; }
+message LsReply { Status status = 1; LsResponse data = 2; }
 
 message StatRequest { string path = 1; }
 message StatResponse {
-  string type = 1;
-  string owner = 2;
-  int32 mode = 3;
-  int32 chunks = 4;
-  int64 size = 5;
+  bool is_dir = 1;
+  int32 mode = 2;
+  string owner = 3;
+  int64 size = 4;
+  int32 chunk_count = 5;
 }
+message StatReply { Status status = 1; StatResponse data = 2; }
 
+message RmRequest { string path = 1; bool recursive = 2; }
+message RmResponse {}
+message RmReply { Status status = 1; RmResponse data = 2; }
+
+message MvRequest { string src = 1; string dst = 2; }
+message MvResponse {}
+message MvReply { Status status = 1; MvResponse data = 2; }
+
+// chunk planning
 message AssignChunkRequest {
   string path = 1;
   int32 index = 2;
+  int32 max_size = 3;
 }
+
 message AssignChunkResponse {
   string chunk_id = 1;
   int32 version = 2;
-  repeated Endpoint pipeline = 3;
+  repeated HostPort pipeline = 3; // data-plane ports
 }
+
+message AssignChunkReply { Status status = 1; AssignChunkResponse data = 2; }
 
 message CommitChunkRequest {
   string path = 1;
   int32 index = 2;
   string chunk_id = 3;
   int32 version = 4;
-  uint32 checksum = 5;
-  int32 size = 6;
-  repeated string node_ids = 7;
+  int32 size = 5;
+  uint32 checksum = 6;
+  repeated HostPort pipeline = 7;
 }
+
+message CommitChunkResponse {}
+message CommitChunkReply { Status status = 1; CommitChunkResponse data = 2; }
 
 message GetFilePlanRequest { string path = 1; }
 
-message FileChunk {
+message ChunkPlan {
   int32 index = 1;
   string chunk_id = 2;
   int32 version = 3;
-  uint32 checksum = 4;
-  int32 size = 5;
-  repeated Endpoint replicas = 6;
+  int32 size = 4;
+  uint32 checksum = 5;
+  repeated HostPort replicas = 6; // data-plane
 }
 
-message GetFilePlanResponse { repeated FileChunk chunks = 1; }
+message GetFilePlanResponse {
+  int64 size = 1;
+  repeated ChunkPlan chunks = 2;
+}
 
-message ReplicateChunkRequest {
+message GetFilePlanReply { Status status = 1; GetFilePlanResponse data = 2; }
+
+// ---------- Master -> DataNode control (repair + gc + fencing) ----------
+message CopyChunkRequest {
   string chunk_id = 1;
   int32 version = 2;
-  Endpoint target = 3;
+  HostPort target_data = 3;
 }
+message CopyChunkResponse {}
+
 message DeleteChunkRequest { string chunk_id = 1; }
+message DeleteChunkResponse {}
+
+message ControlStatus { bool ok = 1; string message = 2; }
 
 service MasterService {
-  rpc RegisterDataNode(RegisterRequest) returns (RegisterResponse);
-  rpc Heartbeat(HeartbeatRequest) returns (Empty);
-  rpc BlockReport(BlockReportRequest) returns (Empty);
+  rpc RegisterDataNode(RegisterDataNodeRequest) returns (RegisterDataNodeReply);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
+  rpc BlockReport(BlockReportRequest) returns (BlockReportReply);
 
-  rpc Mkdir(MkdirRequest) returns (Empty);
-  rpc ListDir(ListDirRequest) returns (ListDirResponse);
-  rpc Stat(StatRequest) returns (StatResponse);
+  rpc Mkdir(MkdirRequest) returns (MkdirReply);
+  rpc Ls(LsRequest) returns (LsReply);
+  rpc Stat(StatRequest) returns (StatReply);
+  rpc Rm(RmRequest) returns (RmReply);
+  rpc Mv(MvRequest) returns (MvReply);
 
-  rpc AssignChunk(AssignChunkRequest) returns (AssignChunkResponse);
-  rpc CommitChunk(CommitChunkRequest) returns (Empty);
-  rpc GetFilePlan(GetFilePlanRequest) returns (GetFilePlanResponse);
+  rpc AssignChunk(AssignChunkRequest) returns (AssignChunkReply);
+  rpc CommitChunk(CommitChunkRequest) returns (CommitChunkReply);
+  rpc GetFilePlan(GetFilePlanRequest) returns (GetFilePlanReply);
 }
 
 service DataNodeControl {
-  rpc ReplicateChunk(ReplicateChunkRequest) returns (Empty);
-  rpc DeleteChunk(DeleteChunkRequest) returns (Empty);
+  rpc CopyChunk(CopyChunkRequest) returns (ControlStatus);
+  rpc DeleteChunk(DeleteChunkRequest) returns (ControlStatus);
 }

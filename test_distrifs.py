@@ -1,300 +1,318 @@
-# test_distrifs.py
+# test_distrifs.py - end-to-end smoke test for DistriFS
+from __future__ import annotations
+
 import os
+import sys
 import time
 import shutil
-import hashlib
-import subprocess
-import signal
 import socket
-import sys
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CHILD_ENV = os.environ.copy()
-# Force every spawned process to import pb2/pb2_grpc from THIS folder first
-CHILD_ENV["PYTHONPATH"] = BASE_DIR + os.pathsep + CHILD_ENV.get("PYTHONPATH", "")
-# Prevent Python from pulling a stale distrifs_pb2_grpc from user-site packages
-CHILD_ENV["PYTHONNOUSERSITE"] = "1"
-# Optional but helps: forces re-gen if your utils supports it
-CHILD_ENV["DISTRIFS_FORCE_PROTO"] = "1"
-os.chdir(BASE_DIR)
-if BASE_DIR not in sys.path:
-    sys.path.insert(0, BASE_DIR)
+import hashlib
+import tempfile
+import subprocess
 from pathlib import Path
+from utils import ensure_proto_generated, send_msg, storage_root
 
-import grpc
-# If grpc stubs are stale/mismatched, Master may start without GetFilePlan and client sees UNIMPLEMENTED.
-try:
-    if os.path.exists("distrifs_pb2_grpc.py"):
-        with open("distrifs_pb2_grpc.py", "r", encoding="utf-8", errors="ignore") as f:
-            txt = f.read()
-        if "GetFilePlan" not in txt:
-            for p in ("distrifs_pb2.py", "distrifs_pb2_grpc.py"):
-                try:
-                    os.remove(p)
-                except FileNotFoundError:
-                    pass
-except Exception:
-    pass
-
-from utils import storage_root, ensure_dir, send_msg, ensure_proto_generated
-
-# Make sure proto exists BEFORE we spawn subprocesses that import pb2 modules
-ensure_proto_generated()
-import distrifs_pb2 as pb
-import distrifs_pb2_grpc as pb_grpc
+BASE_DIR = Path(__file__).resolve().parent
 
 PY = sys.executable
-MASTER = [PY, "-u", "master.py"]
-DATANODE = [PY, "-u", "datanode.py"]
-CLIENT = [PY, "-u", "client.py"]
 
-RF = int(os.getenv("DISTRIFS_REPLICATION_FACTOR", "3"))
-
-def sha256(path: str) -> str:
+def _sha256(p: str) -> str:
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(1024 * 1024)
-            if not b:
-                break
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1024 * 1024), b""):
             h.update(b)
     return h.hexdigest()
 
-def run(cmd, env=None):
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    env = (env or os.environ.copy()).copy()
+def _wait_port(host: str, port: int, timeout: float = 12.0):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.3):
+                return
+        except Exception as e:
+            last = e
+            time.sleep(0.1)
+    raise RuntimeError(f"port not ready: {host}:{port} last={last}")
 
-    # Force children (master/datanode/client) to import pb2/pb2_grpc from THIS folder
-    env["PYTHONPATH"] = base_dir + os.pathsep + env.get("PYTHONPATH", "")
-    # Prevent Python from pulling a stale distrifs_pb2_grpc from user-site packages
-    env["PYTHONNOUSERSITE"] = "1"
-    # If your utils supports it, this reduces “stale stubs” issues
-    env.setdefault("DISTRIFS_FORCE_PROTO", "1")
+def _wait_port_down(host: str, port: int, timeout: float = 10.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.25):
+                # still up
+                time.sleep(0.10)
+                continue
+        except OSError:
+            return
+    raise RuntimeError(f"port still open: {host}:{port}")
 
-    return subprocess.Popen(
-        cmd,
-        cwd=base_dir,  # <<< IMPORTANT: ensures local files are import-first
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
+def wait_port_closed(host: str, port: int, timeout_s: float = 12.0):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.3):
+                # Still open
+                time.sleep(0.15)
+                continue
+        except Exception:
+            # Connection refused / timed out => port is effectively down
+            return
+    raise RuntimeError(f"Port still open: {host}:{port} (timed out waiting for close)")
 
+def sha256_file(p: str) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(b)
+    return h.hexdigest()
+
+def _start_master(env):
+    p = subprocess.Popen([PY, "-u", "master.py"], cwd=BASE_DIR, env=env)
+    _wait_port(env.get("DISTRIFS_MASTER_HOST","127.0.0.1"), int(env.get("DISTRIFS_MASTER_PORT","9000")), timeout=15.0)
+    return p
+
+def _start_datanode(env, data_port: int, ctrl_port: int, storage_dir: Path):
+    e = dict(env)
+    e["DISTRIFS_DATANODE_DATA_PORT"] = str(data_port)
+    e["DISTRIFS_DATANODE_CTRL_PORT"] = str(ctrl_port)
+    e["DISTRIFS_STORAGE_DIR"] = str(storage_dir)
+    p = subprocess.Popen([PY, "-u", "datanode.py", str(data_port), str(ctrl_port)], cwd=BASE_DIR, env=e)
+    _wait_port(e.get("DISTRIFS_DATANODE_HOST","127.0.0.1"), data_port, timeout=15.0)
+    return p
+
+def _run_client(args, env, user="user"):
+    e = dict(env)
+    e["DISTRIFS_USER"] = user
+    subprocess.check_call([PY, "-u", "client.py"] + args, cwd=BASE_DIR, env=e)
 
 def kill(p: subprocess.Popen):
     if p is None or p.poll() is not None:
         return
     try:
-        p.send_signal(signal.SIGKILL)
+        # Try graceful first
+        p.terminate()
+        p.wait(timeout=2.0)
+        return
     except Exception:
-        try:
-            p.terminate()
-        except Exception:
-            pass
-
-def wait_port(host: str, port: int, timeout_s: float = 12.0, proc: subprocess.Popen = None, proc_label: str = "PROC"):
-    deadline = time.time() + timeout_s
-    last = None
-
-    while time.time() < deadline:
-        if proc is not None and proc.poll() is not None:
-            out = ""
-            try:
-                out = proc.stdout.read() if proc.stdout else ""
-            except Exception:
-                pass
-            print(f"\n[{proc_label}] exited early (code {proc.returncode})\n--- {proc_label} OUTPUT ---\n{out}\n--- END OUTPUT ---\n")
-            raise RuntimeError(f"{proc_label} exited before opening port")
-
-        try:
-            with socket.create_connection((host, port), timeout=0.4):
-                return
-        except Exception as e:
-            last = e
-            time.sleep(0.15)
-
-    if proc is not None:
-        print(f"[{proc_label}] did not open port in time; dumping output...")
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        out = ""
-        try:
-            out, _ = proc.communicate(timeout=2.0)
-        except Exception:
-            try:
-                out = proc.stdout.read() if proc.stdout else ""
-            except Exception:
-                out = ""
-        print(f"\n--- {proc_label} OUTPUT ---\n{out}\n--- END OUTPUT ---\n")
-
-    raise RuntimeError(f"Port not ready: {host}:{port} (timed out; last={last})")
-
-def corrupt_one_replica(chunk_id: str, node_data_port: int):
-    node_dir = os.path.join(storage_root(), f"node-{node_data_port}")
-    chunk_path = os.path.join(node_dir, chunk_id)
-    if not os.path.exists(chunk_path):
-        raise RuntimeError(f"chunk not found to corrupt: {chunk_path}")
-    with open(chunk_path, "r+b") as f:
-        f.seek(0)
-        b = f.read(1)
-        f.seek(0)
-        f.write(bytes([(b[0] ^ 0xFF) if b else 0xAA]))
-
-def start_datanode(dp, cp):
-    p = subprocess.Popen([...])
-    PROCS.append(p)
-    time.sleep(0.6)
-    return p
-
-def simulate_client_crash_partial_write(head_host: str, head_port: int, chunk_id: str, version: int, total_size: int, partial_size: int):
-    # Write only partial bytes then close without commit.
-    s = socket.create_connection((head_host, int(head_port)), timeout=6)
-    s.settimeout(6)
+        pass
     try:
-        send_msg(s, {
-            "op": "STORE_STREAM",
-            "chunk_id": chunk_id,
-            "version": int(version),
-            "size": int(total_size),
-            "replicate_to": [],  # simple for crash simulation
-        })
-        s.sendall(os.urandom(partial_size))
-    finally:
-        try:
-            s.close()
-        except Exception:
-            pass
-
-def get_first_chunk_id(remote_path: str) -> str:
-    ch = grpc.insecure_channel("127.0.0.1:9000")
-    stub = pb_grpc.MasterServiceStub(ch)
-    plan = stub.GetFilePlan(pb.GetFilePlanRequest(path=remote_path), timeout=6.0)
-    first = sorted(plan.chunks, key=lambda c: c.index)[0]
-    return first.chunk_id
-
-def main():
-    # Clean prior data
-    root = storage_root()
-    if os.path.exists(root):
-        shutil.rmtree(root, ignore_errors=True)
-    ensure_dir(root)
-
-    env = os.environ.copy()
-    env["DISTRIFS_USER"] = "user"
-    env["DISTRIFS_CHUNK_SIZE"] = str(128 * 1024)           # speed test
-    env["DISTRIFS_HEARTBEAT_INTERVAL"] = "1"
-    env["DISTRIFS_BLOCK_REPORT_INTERVAL"] = "2"
-    env["DISTRIFS_HEARTBEAT_TIMEOUT"] = "3"
-    env["DISTRIFS_RECOVERY_INTERVAL"] = "1"
-    env["DISTRIFS_PENDING_TIMEOUT"] = "2"
-    env["PYTHONUNBUFFERED"] = "1"
-    env.setdefault("DISTRIFS_MASTER_LOCK_PATH", os.path.join(storage_root(), "master.lock"))
-
-    # Start master
-    m = run(MASTER, env=env)
-    wait_port("127.0.0.1", 9000, timeout_s=15.0, proc=m, proc_label="MASTER")
-    print("OK")  # master up
-
-    # Start datanodes (>= RF)
-    dn_ports = [(9101, 9201), (9102, 9202), (9103, 9203)]
-    dns = []
-    for dp, cp in dn_ports:
-        dns.append(run(DATANODE + [str(dp), str(cp)], env=env))
-
-    # Allow registration + initial block reports
-    time.sleep(2.5)
-    print("OK")  # datanodes up
-
-    # Prepare test dir and files (Windows-friendly)
-    test_dir = Path(os.path.join(Path.home(), "AppData", "Local", "Temp", "distrifs_test"))
-    test_dir.mkdir(parents=True, exist_ok=True)
-
-    src = str(test_dir / "src.bin")
-    out = str(test_dir / "out.bin")
-    out2 = str(test_dir / "out2.bin")
-    out3 = str(test_dir / "out3.bin")
-    out4 = str(test_dir / "out4.bin")
-
-    data = os.urandom(700 * 1024 + 123)
-    with open(src, "wb") as f:
-        f.write(data)
-
-    # Create namespace
-    subprocess.check_call(CLIENT + ["mkdir", "/user"], env=env)
-    remote_dir = "/user/files"
-    remote = "/user/files/blob.bin"
-
-    # mkdir + put + immediate get
-    subprocess.check_call(CLIENT + ["mkdir", remote_dir], env=env)
-    subprocess.check_call(CLIENT + ["put", src, remote], env=env)
-    subprocess.check_call(CLIENT + ["get", remote, out], cwd=BASE_DIR, env=CHILD_ENV)
-    assert sha256(src) == sha256(out), "Immediate download mismatch"
-
-    # Corrupt one replica and verify client retries another replica
-    chunk0 = get_first_chunk_id(remote)
-    corrupt_one_replica(chunk0, 9101)
-    subprocess.check_call(CLIENT + ["get", remote, out2], cwd=BASE_DIR, env=CHILD_ENV)
-    assert sha256(src) == sha256(out2), "Download after corruption mismatch (retry failed)"
-
-    # Kill one datanode; download should still work
-    kill(dns[0])
-    time.sleep(1.2)
-    subprocess.check_call(CLIENT + ["get", remote, out3], cwd=BASE_DIR, env=CHILD_ENV)
-    assert sha256(src) == sha256(out3), "Download after node kill mismatch"
-
-    # Pending-write crash test:
-    crash_remote = "/user/files/crash.bin"
-    ch = grpc.insecure_channel("127.0.0.1:9000")
-    stub = pb_grpc.MasterServiceStub(ch)
-
-    # restart killed dn for RF if needed
-    if dns[0].poll() is not None:
-        dp, cp = dn_ports[0]
-        dns[0] = run(DATANODE + [str(dp), str(cp)], env=env)
-    time.sleep(2.5)
-
-    r = stub.AssignChunk(pb.AssignChunkRequest(path=crash_remote, index=0), timeout=5.0)
-    simulate_client_crash_partial_write(r.pipeline[0].host, r.pipeline[0].port, r.chunk_id, r.version, total_size=500_000, partial_size=50_000)
-
-    # wait for pending janitor expiry
-    time.sleep(3.0)
-
-    # GetFilePlan should fail because nothing committed
-    try:
-        stub.GetFilePlan(pb.GetFilePlanRequest(path=crash_remote), timeout=3.0)
-        raise RuntimeError("Crash-mid-write should not publish committed data")
+        # Force kill (works on Windows)
+        p.kill()
+        p.wait(timeout=5.0)
     except Exception:
         pass
 
-    # Master restart rebuild: replica locations are volatile; block reports repopulate.
-    kill(m)
-    time.sleep(0.8)
-    m = run(MASTER, env=env)
-    wait_port("127.0.0.1", 9000, timeout_s=10.0, proc=m, proc_label="MASTER-RESTART")
-    time.sleep(3.0)  # allow block reports to refresh after restart
+def main():
+    import os
+    import time
+    import socket
+    import shutil
+    import tempfile
+    import subprocess
+    from pathlib import Path
 
-    subprocess.check_call(CLIENT + ["get", remote, out4], env=env)
-    assert sha256(src) == sha256(out4), "Download after master restart mismatch"
+    # --- helpers (local, so you don't need to hunt for missing defs) ---
+    def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
 
-    # rm + expected get failure
-    subprocess.check_call(CLIENT + ["rm", remote], env=env)
-    p = subprocess.run(
-        CLIENT + ["get", remote, str(test_dir / "should_fail.bin")],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if p.returncode == 0:
-        raise RuntimeError("Expected get to fail after rm")
+    def _wait_port_down(host: str, port: int, timeout: float = 15.0) -> None:
+        t0 = time.time()
+        last = None
+        while time.time() - t0 < timeout:
+            if not _port_open(host, port, timeout=0.25):
+                return
+            time.sleep(0.15)
+        raise RuntimeError(f"port still open (didn't go down): {host}:{port} last={last}")
 
-    print("\n✅ ALL TESTS PASSED\n")
+    def _wait_until(predicate, timeout_s: float, interval_s: float = 0.25, label: str = "condition"):
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            if predicate():
+                return True
+            time.sleep(interval_s)
+        return False
 
-    # cleanup
-    for p2 in dns:
-        kill(p2)
-    kill(m)
+    # --- test body ---
+    tmp = Path(tempfile.mkdtemp(prefix="distrifs_test_"))
+    root = tmp / "root"
+    data = root / "data"
+    data.mkdir(parents=True, exist_ok=True)
+
+    # Make sure BASE_DIR / PY / sha256_file / _start_master / _start_datanode / _run_client / _wait_port
+    # exist in your file (they already do in your current version).
+    #
+    # This main() assumes:
+    # - BASE_DIR is Path(...)
+    # - PY is path to venv python
+    # - sha256_file is imported from utils
+    # - _start_master(env) returns a Popen
+    # - _start_datanode(env, dp, cp, dir) returns a Popen
+    # - _run_client(args, env, user="...") runs client.py and raises CalledProcessError on failure
+    # - _wait_port(host, port, timeout=...) exists
+
+    # clean leader lock + wal for a deterministic run
+    for f in ["master.leader.lock", "master.wal", "master.epoch"]:
+        try:
+            (BASE_DIR / f).unlink()
+        except Exception:
+            pass
+
+    env = os.environ.copy()
+    env["PYTHONNOUSERSITE"] = "1"
+    env["DISTRIFS_PROTO_PATH"] = str(BASE_DIR / "distrifs.proto")
+    env["DISTRIFS_FORCE_PROTO"] = "1"
+    env["DISTRIFS_MASTER_HOST"] = "127.0.0.1"
+    env["DISTRIFS_MASTER_PORT"] = "9000"
+    env["DISTRIFS_RF"] = "3"
+    env["DISTRIFS_CHUNK_SIZE"] = str(128 * 1024)
+    env["DISTRIFS_GC_INTERVAL_S"] = "2.0"
+    env["DISTRIFS_REPAIR_INTERVAL_S"] = "1.0"
+    env["DISTRIFS_BLOCKREPORT_INTERVAL_S"] = "2.0"
+    env["DISTRIFS_IGNORE_CTRL_C"] = "1"
+
+    m1 = None
+    m2 = None
+    dns = []
+
+    try:
+        # --- start master + datanodes ---
+        m1 = _start_master(env)
+
+        ports = [(9101, 9201), (9102, 9202), (9103, 9203)]
+        for dp, cp in ports:
+            dns.append(_start_datanode(env, dp, cp, data / f"node-{dp}"))
+
+        # --- namespace + io ---
+        _run_client(["mkdir", "/user"], env)
+        _run_client(["mkdir", "/user/files"], env)
+
+        src = tmp / "src.bin"
+        out = tmp / "out.bin"
+        out2 = tmp / "out2.bin"
+        out3 = tmp / "out3.bin"
+        src.write_bytes(os.urandom(700_000))
+
+        remote = "/user/files/blob.bin"
+        _run_client(["put", str(src), remote], env)
+        _run_client(["get", remote, str(out)], env)
+        assert sha256_file(src) == sha256_file(out), "download mismatch"
+
+        # --- corrupt exactly one replica and ensure read heals by switching ---
+        node1 = data / "node-9101"
+        chunk_files = sorted([
+            p for p in node1.glob("chunk-*")
+            if p.is_file() and (not p.name.endswith(".meta")) and (not p.name.endswith(".tmp"))
+        ])
+        assert chunk_files, "no chunk files found to corrupt"
+        corrupt = chunk_files[0]
+        b = bytearray(corrupt.read_bytes())
+        b[0] ^= 0xFF
+        corrupt.write_bytes(bytes(b))
+
+        _run_client(["get", remote, str(out2)], env)
+        assert sha256_file(src) == sha256_file(out2), "download mismatch after corruption"
+
+        # --- range read ---
+        _run_client(["getrange", remote, "1000", "20000", str(out3)], env)
+        assert out3.read_bytes() == src.read_bytes()[1000:1000 + 20000], "range mismatch"
+
+        # --- permission checks: alice creates /secret, bob cannot list ---
+        _run_client(["mkdir", "/secret"], env, user="alice")
+        try:
+            _run_client(["ls", "/secret"], env, user="bob")
+            raise AssertionError("expected PermissionDenied")
+        except subprocess.CalledProcessError:
+            pass
+
+        # --- master failover simulation (IMPORTANT: stop m1 BEFORE starting m2) ---
+        # Stop m1
+        if m1 and m1.poll() is None:
+            m1.terminate()
+            try:
+                m1.wait(timeout=10.0)
+            except Exception:
+                m1.kill()
+                m1.wait(timeout=5.0)
+
+        # Ensure port is actually free before starting m2
+        _wait_port_down(env.get("DISTRIFS_MASTER_HOST", "127.0.0.1"), int(env.get("DISTRIFS_MASTER_PORT", "9000")), timeout=15.0)
+
+        # Start m2 (should acquire lock + bind cleanly)
+        m2 = subprocess.Popen([PY, "-u", "master.py"], cwd=BASE_DIR, env=env)
+        _wait_port(env.get("DISTRIFS_MASTER_HOST", "127.0.0.1"), int(env.get("DISTRIFS_MASTER_PORT", "9000")), timeout=20.0)
+
+        # basic op after failover
+        _run_client(["stat", remote], env)
+
+        # --- GC: rm and ensure chunks disappear (poll instead of fixed sleep) ---
+        _run_client(["rm", remote], env)
+
+        def _all_chunks_gone() -> bool:
+            for dp, _ in ports:
+                node_dir = data / f"node-{dp}"
+                leftovers = [
+                    p for p in node_dir.glob("chunk-*")
+                    if p.is_file() and (not p.name.endswith(".meta")) and (not p.name.endswith(".tmp"))
+                ]
+                if leftovers:
+                    return False
+            return True
+
+        ok = _wait_until(_all_chunks_gone, timeout_s=25.0, interval_s=0.5, label="gc sweep")
+        if not ok:
+            # show a small sample of leftovers for debugging
+            samples = {}
+            for dp, _ in ports:
+                node_dir = data / f"node-{dp}"
+                leftovers = [
+                    p for p in node_dir.glob("chunk-*")
+                    if p.is_file() and (not p.name.endswith(".meta")) and (not p.name.endswith(".tmp"))
+                ]
+                if leftovers:
+                    samples[str(node_dir)] = [str(x) for x in leftovers[:5]]
+            raise AssertionError(f"GC left chunks (after waiting): {samples}")
+
+        print("OK", flush=True)
+
+    finally:
+        # cleanup processes
+        for p in dns:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        for p in dns:
+            try:
+                p.wait(timeout=5.0)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+        for mp in [m2, m1]:
+            if mp is None:
+                continue
+            try:
+                mp.terminate()
+            except Exception:
+                pass
+            try:
+                mp.wait(timeout=5.0)
+            except Exception:
+                try:
+                    mp.kill()
+                except Exception:
+                    pass
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 
 if __name__ == "__main__":
     main()

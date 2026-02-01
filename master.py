@@ -1,897 +1,810 @@
+# master.py - DistriFS Master (metadata + coordinator)
+from __future__ import annotations
+
 import os
 import time
 import threading
 import uuid
-import sys
-import importlib.util
-from typing import Any, Dict, List, Tuple, Set, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
 
 import grpc
 from concurrent import futures
 
-from utils import wal_append, wal_iter, ensure_proto_generated, storage_root, ensure_dir
+from utils import wal_append, wal_iter, ensure_proto_generated, read_master_epoch
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-os.chdir(BASE_DIR)
-if BASE_DIR not in sys.path:
-    sys.path.insert(0, BASE_DIR)
-os.environ.setdefault("PYTHONNOUSERSITE", "1")
+# Generate pb2 on demand
+ensure_proto_generated(force=bool(os.getenv("DISTRIFS_FORCE_PROTO")))
 
-ensure_proto_generated()
+import distrifs_pb2 as pb
+import distrifs_pb2_grpc as pb_grpc
 
-def _load_local(modname: str, filename: str):
-    path = os.path.join(BASE_DIR, filename)
-    spec = importlib.util.spec_from_file_location(modname, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[modname] = module
-    assert spec and spec.loader
-    spec.loader.exec_module(module)
-    return module
+if os.name == "nt" and os.getenv("DISTRIFS_IGNORE_CTRL_C") == "1":
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(None, True)
+    except Exception:
+        pass
 
-pb = _load_local("distrifs_pb2", "distrifs_pb2.py")
-pb_grpc = _load_local("distrifs_pb2_grpc", "distrifs_pb2_grpc.py")
-print("[MASTER] USING:", pb_grpc.__file__)
-
-
+# -------------------------
+# Configuration
+# -------------------------
 MASTER_HOST = os.getenv("DISTRIFS_MASTER_HOST", "127.0.0.1")
 MASTER_PORT = int(os.getenv("DISTRIFS_MASTER_PORT", "9000"))
+RF = int(os.getenv("DISTRIFS_RF", "3"))
 
-WAL_PATH = os.getenv("DISTRIFS_MASTER_WAL", os.path.join(storage_root(), "master.wal"))
+HB_INTERVAL = float(os.getenv("DISTRIFS_HB_INTERVAL_S", "3.0"))
+HB_TIMEOUT = float(os.getenv("DISTRIFS_HB_TIMEOUT_S", "9.0"))
 
-REPLICATION_FACTOR = int(os.getenv("DISTRIFS_REPLICATION_FACTOR", "3"))
-HEARTBEAT_INTERVAL = int(os.getenv("DISTRIFS_HEARTBEAT_INTERVAL", "3"))
-HEARTBEAT_TIMEOUT = int(os.getenv("DISTRIFS_HEARTBEAT_TIMEOUT", str(HEARTBEAT_INTERVAL * 3)))  # default 9s
-RECOVERY_INTERVAL = int(os.getenv("DISTRIFS_RECOVERY_INTERVAL", "2"))
-PENDING_TIMEOUT = int(os.getenv("DISTRIFS_PENDING_TIMEOUT", "60"))
+WAL_PATH = os.getenv("DISTRIFS_WAL", "master.wal")
+EPOCH_PATH = os.getenv("DISTRIFS_EPOCH_PATH", "master.epoch")
+LEADER_LOCK = os.getenv("DISTRIFS_LEADER_LOCK", "master.leader.lock")
 
-# Leader election / split-brain fencing (single leader via OS lock)
-LOCK_PATH = os.getenv("DISTRIFS_MASTER_LOCK_PATH", os.path.join(storage_root(), "master.lock"))
-
-# ------------------------------
-# In-memory state (RAM)
-# ------------------------------
-DIRS: Dict[str, Dict[str, Any]] = {}   # path -> {owner, mode, dirs:set(fullpaths), files:set(fullpaths)}
-FILES: Dict[str, Dict[str, Any]] = {}  # path -> {owner, mode, chunks:[chunk_id], versions:[int], checksums:[int], sizes:[int], total_size:int}
-
-# chunk registry for COMMITTED data; replicas are VOLATILE and rebuilt by block reports after restart
-CHUNK_REGISTRY: Dict[str, Dict[str, Any]] = {}  # chunk_id -> {version:int, checksum:int, size:int, replicas:set(node_id)}
-
-# pending assignments (durable via WAL Assign; cleared on Commit or timeout)
-PENDING: Dict[Tuple[str, int], Dict[str, Any]] = {}  # (path, index) -> {chunk_id, version, pipeline_node_ids, ts}
-
-ACTIVE_NODES: Dict[str, Dict[str, Any]] = {}  # node_id -> {host, data_port, control_port, last_seen}
-
-# Locks
-DIRS_LOCK = threading.RLock()
-FILES_LOCK = threading.RLock()
-CHUNK_LOCK = threading.RLock()
-PENDING_LOCK = threading.RLock()
-NODES_LOCK = threading.Lock()
+GC_INTERVAL = float(os.getenv("DISTRIFS_GC_INTERVAL_S", "10.0"))
+REPAIR_INTERVAL = float(os.getenv("DISTRIFS_REPAIR_INTERVAL_S", "5.0"))
 
 # WAL opcodes
 OP_MKDIR = 1
-OP_CREATE_FILE_META = 2
-OP_ASSIGN = 3
-OP_COMMIT = 4
-OP_DELETE_PATH = 5
-OP_RENAME_PATH = 6
+OP_CREATE_FILE = 2
+OP_ASSIGN_CHUNK = 3
+OP_COMMIT_CHUNK = 4
+OP_RM = 5
+OP_MV = 6
 
+# -------------------------
+# Data model
+# -------------------------
+@dataclass
+class NodeInfo:
+    node_id: str
+    host: str
+    data_port: int
+    control_port: int
+    last_hb: float = field(default_factory=lambda: time.time())
+    alive: bool = True
 
+    def data_addr(self) -> Tuple[str, int]:
+        return (self.host, self.data_port)
+
+    def ctrl_addr(self) -> Tuple[str, int]:
+        return (self.host, self.control_port)
+
+@dataclass
+class ChunkRecord:
+    chunk_id: str
+    version: int = 1
+    size: int = 0
+    checksum: int = 0  # CRC32
+    replicas: Set[str] = field(default_factory=set)  # node_ids
+
+@dataclass
+class Inode:
+    is_dir: bool
+    owner: str
+    mode: int
+    children: Set[str] = field(default_factory=set)  # names, not full paths
+    chunks: Dict[int, str] = field(default_factory=dict)  # index -> chunk_id
+
+# -------------------------
+# Master state
+# -------------------------
+STATE_LOCK = threading.RLock()
+
+NODES: Dict[str, NodeInfo] = {}               # node_id -> NodeInfo
+PATHS: Dict[str, Inode] = {}                  # full path -> inode
+CHUNKS: Dict[str, ChunkRecord] = {}           # chunk_id -> chunk record
+FILE_INDEX_TO_CHUNK: Dict[Tuple[str, int], str] = {}  # (path,index) -> chunk_id
+CHUNK_REFCOUNT: Dict[str, int] = {}           # chunk_id -> count
+GC_QUEUE: List[str] = []                      # chunk_ids pending delete
+
+LEADER_EPOCH = 0
+STOP = threading.Event()
+
+def _ok(data=None):
+    return pb.Status(ok=True), data
+
+def _err(msg: str):
+    return pb.Status(ok=False, error=pb.Error(message=msg)), None
+
+# -------------------------
+# Path helpers + permissions
+# -------------------------
 def _norm(p: str) -> str:
     if not p:
         return "/"
     if not p.startswith("/"):
         p = "/" + p
-    if p != "/" and p.endswith("/"):
+    # collapse multiple slashes
+    while "//" in p:
+        p = p.replace("//", "/")
+    if len(p) > 1 and p.endswith("/"):
         p = p[:-1]
     return p
-
 
 def _parent(p: str) -> str:
     p = _norm(p)
     if p == "/":
         return "/"
-    parts = p.split("/")
-    if len(parts) <= 2:
+    i = p.rfind("/")
+    return "/" if i == 0 else p[:i]
+
+def _name(p: str) -> str:
+    p = _norm(p)
+    if p == "/":
         return "/"
-    return "/".join(parts[:-1])
+    return p.split("/")[-1]
 
+def _mode_bits(inode: Inode) -> Tuple[int,int,int]:
+    # owner bits only for now: rwx in high triad
+    owner = (inode.mode >> 6) & 0b111
+    group = (inode.mode >> 3) & 0b111
+    other = inode.mode & 0b111
+    return owner, group, other
 
-def _caller(context) -> str:
-    # Permission enforcement via gRPC metadata, no proto changes needed.
+def _can_read(user: str, inode: Inode) -> bool:
+    owner, group, other = _mode_bits(inode)
+    bits = owner if user == inode.owner else other
+    return bool(bits & 0b100)
+
+def _can_write(user: str, inode: Inode) -> bool:
+    owner, group, other = _mode_bits(inode)
+    bits = owner if user == inode.owner else other
+    return bool(bits & 0b010)
+
+def _can_exec(user: str, inode: Inode) -> bool:
+    owner, group, other = _mode_bits(inode)
+    bits = owner if user == inode.owner else other
+    return bool(bits & 0b001)
+
+def _require_parent_dir(path: str) -> Tuple[Optional[Inode], Optional[str]]:
+    path = _norm(path)
+    par = _parent(path)
+    inode = PATHS.get(par)
+    if not inode or not inode.is_dir:
+        return None, f"Parent directory missing: {par}"
+    return inode, None
+
+def _user_from_md(context) -> str:
     try:
         md = dict(context.invocation_metadata() or [])
-        u = md.get("x-user") or md.get("user") or "user"
-        return str(u)
+        return md.get("x-user", "user") or "user"
     except Exception:
         return "user"
 
+# -------------------------
+# Leadership (lock + fencing epoch)
+# -------------------------
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+def _acquire_leader_lock():
+    global _LEADER_LOCK_FH
+
+    path = LEADER_LOCK
+    fh = open(path, "a+b")
 
-def _perm_check(mode: int, owner: str, user: str, need: str) -> None:
-    """
-    Very small POSIX-ish model: owner bits if user==owner else "other" bits.
-    need: any of {'r','w','x'}.
-    """
-    if user == "root":
-        return
-    if user == owner:
-        shift = 6
-    else:
-        shift = 0
-    bits = (int(mode) >> shift) & 0b111
-    req = 0
-    if "r" in need:
-        req |= 0b100
-    if "w" in need:
-        req |= 0b010
-    if "x" in need:
-        req |= 0b001
-    if (bits & req) != req:
-        raise RuntimeError("PermissionDenied")
-
-
-def ensure_root() -> None:
-    with DIRS_LOCK:
-        if "/" not in DIRS:
-            DIRS["/"] = {"owner": "root", "mode": 0o777, "dirs": set(), "files": set()}
-
-
-def _ensure_parent_dir(path: str, user: Optional[str] = None, need_on_parent: str = "x") -> None:
-    ensure_root()
-    par = _parent(path)
-    with DIRS_LOCK:
-        if par not in DIRS:
-            raise RuntimeError(f"Parent directory missing: {par}")
-        if user is not None:
-            d = DIRS[par]
-            # To create/delete/rename within parent: need write+exec. To traverse: exec.
-            _perm_check(int(d["mode"]), str(d["owner"]), user, need_on_parent)
-
-
-def _is_dir(path: str) -> bool:
-    with DIRS_LOCK:
-        return _norm(path) in DIRS
-
-
-def _is_file(path: str) -> bool:
-    with FILES_LOCK:
-        return _norm(path) in FILES
-
-
-def _apply_mkdir(path: str, owner: str, mode: int) -> None:
-    path = _norm(path)
-    ensure_root()
-    par = _parent(path)
-    with DIRS_LOCK:
-        if path in DIRS:
-            return
-        if par not in DIRS:
-            raise RuntimeError(f"Parent dir missing: {par}")
-        DIRS[path] = {"owner": owner, "mode": int(mode), "dirs": set(), "files": set()}
-        DIRS[par]["dirs"].add(path)
-
-
-def _apply_create_file_meta(path: str, owner: str, mode: int) -> None:
-    path = _norm(path)
-    ensure_root()
-    par = _parent(path)
-    with DIRS_LOCK:
-        if par not in DIRS:
-            raise RuntimeError(f"Parent directory missing: {par}")
-    with FILES_LOCK:
-        if path in FILES:
-            return
-        FILES[path] = {
-            "owner": owner,
-            "mode": int(mode),
-            "chunks": [],
-            "versions": [],
-            "checksums": [],
-            "sizes": [],
-            "total_size": 0,
-        }
-    with DIRS_LOCK:
-        DIRS[par]["files"].add(path)
-
-
-def _apply_assign_pending(path: str, idx: int, chunk_id: str, version: int, pipeline_node_ids: List[str], ts: float) -> None:
-    path = _norm(path)
-    key = (path, int(idx))
-    with PENDING_LOCK:
-        PENDING[key] = {
-            "chunk_id": chunk_id,
-            "version": int(version),
-            "pipeline_node_ids": list(pipeline_node_ids),
-            "ts": float(ts),
-        }
-
-
-def _apply_commit(payload: Dict[str, Any], node_ids_for_memory: Optional[List[str]] = None) -> None:
-    """
-    Important for "volatile location registry":
-      - WAL commit payload does NOT persist node_ids
-      - But during live operation, we DO populate replicas in memory from node_ids passed in (from client).
-      - On restart, replicas are rebuilt by BlockReport disk scans.
-    """
-    path = _norm(payload["path"])
-    idx = int(payload["index"])
-    chunk_id = payload["chunk_id"]
-    version = int(payload["version"])
-    checksum = int(payload["checksum"])
-    size = int(payload["size"])
-
-    with FILES_LOCK:
-        if path not in FILES:
-            raise RuntimeError("Commit for unknown file")
-        meta = FILES[path]
-        while len(meta["chunks"]) <= idx:
-            meta["chunks"].append("")
-            meta["versions"].append(1)
-            meta["checksums"].append(0)
-            meta["sizes"].append(0)
-
-        meta["chunks"][idx] = chunk_id
-        meta["versions"][idx] = version
-        meta["checksums"][idx] = checksum
-        meta["sizes"][idx] = size
-        meta["total_size"] = int(sum(meta["sizes"]))
-
-    with CHUNK_LOCK:
-        reg = CHUNK_REGISTRY.setdefault(chunk_id, {"version": version, "checksum": 0, "size": 0, "replicas": set()})
-        reg["version"] = version
-        reg["checksum"] = checksum
-        reg["size"] = size
-        if node_ids_for_memory:
-            for nid in node_ids_for_memory:
-                reg["replicas"].add(nid)
-
-    with PENDING_LOCK:
-        PENDING.pop((path, idx), None)
-
-
-def _apply_delete_path(path: str) -> None:
-    path = _norm(path)
-    if path == "/":
-        raise RuntimeError("Refuse delete /")
-
-    # file delete
-    with FILES_LOCK:
-        fmeta = FILES.get(path)
-    if fmeta is not None:
-        # remove from dir index
-        with DIRS_LOCK:
-            par = _parent(path)
-            if par in DIRS:
-                DIRS[par]["files"].discard(path)
-
-        # best-effort chunk deletions on replicas
-        chunks = list(fmeta.get("chunks", []))
-        with FILES_LOCK:
-            FILES.pop(path, None)
-
-        for cid in chunks:
-            if not cid:
-                continue
-            # remove registry entry after best-effort deletions
-            replicas: List[str] = []
-            with CHUNK_LOCK:
-                reg = CHUNK_REGISTRY.get(cid)
-                if reg:
-                    replicas = list(reg.get("replicas", []))
-            for nid in replicas:
-                try:
-                    _delete_chunk_on_node(nid, cid)
-                except Exception:
-                    pass
-            with CHUNK_LOCK:
-                CHUNK_REGISTRY.pop(cid, None)
-        return
-
-    # directory delete (must be empty)
-    with DIRS_LOCK:
-        if path not in DIRS:
-            raise RuntimeError("No such path")
-        d = DIRS[path]
-        if d["dirs"] or d["files"]:
-            raise RuntimeError("DirectoryNotEmpty")
-        par = _parent(path)
-        if par in DIRS:
-            DIRS[par]["dirs"].discard(path)
-        DIRS.pop(path, None)
-
-
-def _apply_rename_path(src: str, dst: str) -> None:
-    src = _norm(src)
-    dst = _norm(dst)
-    if src == "/" or dst == "/":
-        raise RuntimeError("Invalid rename")
-
-    # Only support:
-    # - file rename
-    # - empty directory rename
-    if _is_file(src):
-        with FILES_LOCK:
-            f = FILES.pop(src)
-            FILES[dst] = f
-        with DIRS_LOCK:
-            sp = _parent(src)
-            dp = _parent(dst)
-            if sp in DIRS:
-                DIRS[sp]["files"].discard(src)
-            if dp not in DIRS:
-                raise RuntimeError("Parent directory missing")
-            DIRS[dp]["files"].add(dst)
-        return
-
-    if _is_dir(src):
-        with DIRS_LOCK:
-            d = DIRS[src]
-            if d["dirs"] or d["files"]:
-                raise RuntimeError("RenameNonEmptyDirNotSupported")
-            sp = _parent(src)
-            dp = _parent(dst)
-            if dp not in DIRS:
-                raise RuntimeError("Parent directory missing")
-            DIRS.pop(src)
-            DIRS[dst] = d
-            if sp in DIRS:
-                DIRS[sp]["dirs"].discard(src)
-            DIRS[dp]["dirs"].add(dst)
-        return
-
-    raise RuntimeError("No such path")
-
-
-def recover_from_wal() -> None:
-    ensure_root()
-    for op, payload in wal_iter(WAL_PATH):
-     try:
-        if op == OP_MKDIR:
-            _apply_mkdir(payload["path"], payload["owner"], int(payload["mode"]))
-        elif op == OP_CREATE_FILE_META:
-            _apply_create_file_meta(payload["path"], payload["owner"], int(payload["mode"]))
-        elif op == OP_ASSIGN:
-            _apply_assign_pending(
-                payload["path"],
-                int(payload["index"]),
-                payload["chunk_id"],
-                int(payload["version"]),
-                list(payload.get("pipeline_node_ids", [])),
-                float(payload.get("ts", time.time())),
-            )
-        elif op == OP_COMMIT:
-            _apply_commit(payload, node_ids_for_memory=None)
-        elif op == OP_DELETE_PATH:
-            _apply_delete_path(payload["path"])
-        elif op == OP_RENAME_PATH:
-            _apply_rename_path(payload["src"], payload["dst"])
-     except Exception as e:
-        # Never crash the master on a bad WAL record; skip and continue.
-        print(f"[MASTER] WAL replay: skipping corrupt/old record op={op} payload_keys={list(payload.keys())} err={e}")
-        continue
-
-
-    # ensure replica sets start empty; block reports rebuild them.
-    with CHUNK_LOCK:
-        for reg in CHUNK_REGISTRY.values():
-            reg["replicas"] = set()
-
-    print("[MASTER] WAL replay complete; replica locations will be rebuilt via block reports.")
-
-
-def _node_snapshot() -> List[Tuple[str, Dict[str, Any]]]:
-    with NODES_LOCK:
-        return list(ACTIVE_NODES.items())
-
-
-def _select_pipeline() -> Tuple[List[str], List[pb.Endpoint]]:
-    items = _node_snapshot()
-    if len(items) < REPLICATION_FACTOR:
-        raise RuntimeError("CP write denied: not enough active DataNodes for replication factor")
-
-    # Simple but not pathological: rotate by current time tick
-    start = int(time.time()) % len(items)
-    rotated = items[start:] + items[:start]
-    chosen = rotated[:REPLICATION_FACTOR]
-
-    node_ids = [nid for nid, _ in chosen]
-    pipeline = [pb.Endpoint(host=info["host"], port=int(info["data_port"])) for _, info in chosen]
-    return node_ids, pipeline
-
-
-def _node_endpoints(node_id: str) -> Tuple[str, int, int]:
-    with NODES_LOCK:
-        n = ACTIVE_NODES[node_id]
-        return n["host"], int(n["data_port"]), int(n["control_port"])
-
-
-def _delete_chunk_on_node(node_id: str, chunk_id: str) -> None:
-    host, _, ctrl = _node_endpoints(node_id)
-    channel = grpc.insecure_channel(f"{host}:{ctrl}")
-    stub = pb_grpc.DataNodeControlStub(channel)
-    stub.DeleteChunk(pb.DeleteChunkRequest(chunk_id=chunk_id), timeout=8.0)
-    with CHUNK_LOCK:
-        if chunk_id in CHUNK_REGISTRY:
-            CHUNK_REGISTRY[chunk_id]["replicas"].discard(node_id)
-
-
-def _replicate_one(chunk_id: str) -> None:
-    with CHUNK_LOCK:
-        reg = CHUNK_REGISTRY.get(chunk_id)
-        if not reg:
-            return
-        replicas: Set[str] = set(reg["replicas"])
-        version = int(reg["version"])
-        if 0 == len(replicas) or len(replicas) >= REPLICATION_FACTOR:
-            return
-
-    items = _node_snapshot()
-    active_ids = [nid for nid, _ in items]
-
-    src = next(iter(replicas))
-    candidates = [nid for nid in active_ids if nid not in replicas]
-    if not candidates:
-        return
-    tgt = candidates[0]
-
-    shost, _, sctrl = _node_endpoints(src)
-    thost, tdata, _ = _node_endpoints(tgt)
-
-    channel = grpc.insecure_channel(f"{shost}:{sctrl}")
-    stub = pb_grpc.DataNodeControlStub(channel)
-    stub.ReplicateChunk(
-        pb.ReplicateChunkRequest(
-            chunk_id=chunk_id,
-            version=version,
-            target=pb.Endpoint(host=thost, port=int(tdata)),
-        ),
-        timeout=12.0,
-    )
-
-    with CHUNK_LOCK:
-        CHUNK_REGISTRY[chunk_id]["replicas"].add(tgt)
-    print(f"[MASTER] Re-replicated {chunk_id}: {src} -> {tgt}")
-
-
-def dead_node_monitor_loop() -> None:
-    while True:
-        time.sleep(1.0)
-        now = time.time()
-        dead: List[str] = []
-        with NODES_LOCK:
-            for nid, info in list(ACTIVE_NODES.items()):
-                if now - float(info["last_seen"]) > HEARTBEAT_TIMEOUT:
-                    dead.append(nid)
-            for nid in dead:
-                ACTIVE_NODES.pop(nid, None)
-
-        if dead:
-            print(f"[MASTER] Dead nodes: {dead}")
-            with CHUNK_LOCK:
-                for _, reg in CHUNK_REGISTRY.items():
-                    for nid in dead:
-                        reg["replicas"].discard(nid)
-
-
-def passive_recovery_loop() -> None:
-    while True:
-        time.sleep(RECOVERY_INTERVAL)
-        with CHUNK_LOCK:
-            under = [cid for cid, reg in CHUNK_REGISTRY.items()
-                     if 0 < len(reg["replicas"]) < REPLICATION_FACTOR]
-        for cid in under:
-            try:
-                _replicate_one(cid)
-            except Exception as e:
-                print(f"[MASTER] Replication failed for {cid}: {e}")
-
-
-def pending_janitor_loop() -> None:
-    while True:
-        time.sleep(1.0)
-        now = time.time()
-        expired: List[Tuple[str, int, Dict[str, Any]]] = []
-        with PENDING_LOCK:
-            for (path, idx), info in list(PENDING.items()):
-                if now - float(info["ts"]) > PENDING_TIMEOUT:
-                    expired.append((path, idx, info))
-                    PENDING.pop((path, idx), None)
-
-        # Best-effort cleanup: delete the assigned chunk from the originally planned pipeline.
-        for path, idx, info in expired:
-            chunk_id = info["chunk_id"]
-            pipeline = list(info.get("pipeline_node_ids", []))
-            print(f"[MASTER] Pending write expired for {path} idx={idx} chunk={chunk_id}; cleanup")
-            for nid in pipeline:
-                try:
-                    _delete_chunk_on_node(nid, chunk_id)
-                except Exception:
-                    pass
-
-
-class Master(pb_grpc.MasterServiceServicer):
-    # -------------------
-    # DataNode RPCs
-    # -------------------
-    def RegisterDataNode(self, request: pb.RegisterRequest, context) -> pb.RegisterResponse:
-        peer = context.peer()  # e.g. "ipv4:127.0.0.1:54321" or "ipv6:[::1]:54321"
-        host = "127.0.0.1"
-
-        try:
-            if peer.startswith("ipv4:"):
-                # "ipv4:IP:PORT"
-                rest = peer[len("ipv4:"):]
-                # split from the right: IP may contain ":" only in ipv6; ipv4 safe
-                host = rest.rsplit(":", 1)[0]
-            elif peer.startswith("ipv6:"):
-                rest = peer[len("ipv6:"):]
-                # formats can be "[::1]:PORT" or "::1:PORT"
-                if rest.startswith("["):
-                    host = rest.split("]")[0].lstrip("[")
-                else:
-                    host = rest.rsplit(":", 1)[0]
-                # Prefer ipv4 localhost for your Windows demo unless you explicitly want ipv6
-                if host in ("::1", "0:0:0:0:0:0:0:1"):
-                    host = "127.0.0.1"
-            else:
-                # fallback: try last-resort parse
-                if ":" in peer:
-                    host = peer.rsplit(":", 1)[0]
-        except Exception:
-            host = "127.0.0.1"
-
-        node_id = f"dn-{host}-{int(request.data_port)}"
-        with NODES_LOCK:
-            ACTIVE_NODES[node_id] = {
-                "host": host,
-                "data_port": int(request.data_port),
-                "control_port": int(request.control_port),
-                "last_seen": time.time(),
-            }
-        print(f"[MASTER] Registered {node_id} peer={peer} data={request.data_port} ctrl={request.control_port}")
-        return pb.RegisterResponse(node_id=node_id)
-
-
-
-
-    def Heartbeat(self, request: pb.HeartbeatRequest, context) -> pb.Empty:
-        with NODES_LOCK:
-            if request.node_id in ACTIVE_NODES:
-                ACTIVE_NODES[request.node_id]["last_seen"] = time.time()
-        return pb.Empty()
-
-    def BlockReport(self, request: pb.BlockReportRequest, context) -> pb.Empty:
-        nid = request.node_id
-
-        with CHUNK_LOCK:
-            committed_versions = {cid: int(reg["version"]) for cid, reg in CHUNK_REGISTRY.items()}
-
-        with PENDING_LOCK:
-            pending_versions = {info["chunk_id"]: int(info["version"]) for info in PENDING.values()}
-
-        for cv in request.chunks:
-            cid = cv.chunk_id
-            ver = int(cv.version)
-            committed_ver = committed_versions.get(cid)
-            pending_ver = pending_versions.get(cid)
-
-            # delete anything older than committed
-            if committed_ver is not None and ver < committed_ver:
-                threading.Thread(target=_delete_chunk_on_node, args=(nid, cid), daemon=True).start()
-                continue
-
-            # if a node reports a version higher than known committed/pending -> unknown/stale
-            max_known = committed_ver if committed_ver is not None else None
-            if pending_ver is not None:
-                max_known = pending_ver if max_known is None else max(max_known, pending_ver)
-            if max_known is not None and ver > max_known:
-                threading.Thread(target=_delete_chunk_on_node, args=(nid, cid), daemon=True).start()
-                continue
-
-            # rebuild replica locations for committed chunks
-            if committed_ver is not None and ver == committed_ver:
-                with CHUNK_LOCK:
-                    if cid in CHUNK_REGISTRY:
-                        CHUNK_REGISTRY[cid]["replicas"].add(nid)
-
-        return pb.Empty()
-
-    # -------------------
-    # Client RPCs
-    # -------------------
-    def Mkdir(self, request: pb.MkdirRequest, context) -> pb.Empty:
-        user = _caller(context)
-        path = _norm(request.path)
-        _ensure_parent_dir(path, user=user, need_on_parent="wx")
-
-        wal_append(WAL_PATH, OP_MKDIR, {"path": path, "owner": request.owner, "mode": int(request.mode)})
-        _apply_mkdir(path, request.owner, int(request.mode))
-        return pb.Empty()
-
-    def ListDir(self, request: pb.ListDirRequest, context) -> pb.ListDirResponse:
-        user = _caller(context)
-        path = _norm(request.path)
-        ensure_root()
-        with DIRS_LOCK:
-            if path not in DIRS:
-                raise RuntimeError("No such directory")
-            d = DIRS[path]
-            _perm_check(int(d["mode"]), str(d["owner"]), user, "rx")
-            dirs = sorted([p.split("/")[-1] for p in d["dirs"]])
-            files = sorted([p.split("/")[-1] for p in d["files"]])
-        return pb.ListDirResponse(dirs=dirs, files=files)
-
-    def Stat(self, request: pb.StatRequest, context) -> pb.StatResponse:
-        user = _caller(context)
-        path = _norm(request.path)
-        ensure_root()
-        with DIRS_LOCK:
-            if path in DIRS:
-                d = DIRS[path]
-                _perm_check(int(d["mode"]), str(d["owner"]), user, "x")
-                return pb.StatResponse(type="dir", owner=d["owner"], mode=int(d["mode"]), chunks=0, size=0)
-        with FILES_LOCK:
-            if path in FILES:
-                f = FILES[path]
-                # for stat, require read or at least execute on parent; we enforce 'x' on parent
-                _ensure_parent_dir(path, user=user, need_on_parent="x")
-                committed = len([c for c in f["chunks"] if c])
-                return pb.StatResponse(type="file", owner=f["owner"], mode=int(f["mode"]), chunks=int(committed), size=int(f["total_size"]))
-        raise RuntimeError("No such path")
-
-    def DeletePath(self, request: pb.DeletePathRequest, context) -> pb.Empty:
-        user = _caller(context)
-        path = _norm(request.path)
-        if path == "/":
-            raise RuntimeError("Refuse delete /")
-
-        # Need write on parent. Also need write on file/dir itself (basic model).
-        _ensure_parent_dir(path, user=user, need_on_parent="wx")
-
-        # Check target permissions
-        with DIRS_LOCK:
-            if path in DIRS:
-                d = DIRS[path]
-                _perm_check(int(d["mode"]), str(d["owner"]), user, "w")
-        with FILES_LOCK:
-            if path in FILES:
-                f = FILES[path]
-                _perm_check(int(f["mode"]), str(f["owner"]), user, "w")
-
-        wal_append(WAL_PATH, OP_DELETE_PATH, {"path": path})
-        _apply_delete_path(path)
-        return pb.Empty()
-
-    def RenamePath(self, request: pb.RenamePathRequest, context) -> pb.Empty:
-        user = _caller(context)
-        src = _norm(request.src)
-        dst = _norm(request.dst)
-
-        _ensure_parent_dir(src, user=user, need_on_parent="wx")
-        _ensure_parent_dir(dst, user=user, need_on_parent="wx")
-
-        # must have write on source and destination parent; enforce write on source object too
-        with DIRS_LOCK:
-            if src in DIRS:
-                d = DIRS[src]
-                _perm_check(int(d["mode"]), str(d["owner"]), user, "w")
-        with FILES_LOCK:
-            if src in FILES:
-                f = FILES[src]
-                _perm_check(int(f["mode"]), str(f["owner"]), user, "w")
-
-        wal_append(WAL_PATH, OP_RENAME_PATH, {"src": src, "dst": dst})
-        _apply_rename_path(src, dst)
-        return pb.Empty()
-
-    def AssignChunk(self, request: pb.AssignChunkRequest, context) -> pb.AssignChunkResponse:
-        user = _caller(context)
-        path = _norm(request.path)
-        idx = int(request.index)
-        _ensure_parent_dir(path, user=user, need_on_parent="wx")  # create/overwrite needs write+exec on parent
-
-        pipeline_node_ids, pipeline = _select_pipeline()
-
-        # ensure file meta exists
-        with FILES_LOCK:
-            if path not in FILES:
-                wal_append(WAL_PATH, OP_CREATE_FILE_META, {"path": path, "owner": user, "mode": 0o644})
-                _apply_create_file_meta(path, owner=user, mode=0o644)
-            meta = FILES[path]
-            _perm_check(int(meta["mode"]), str(meta["owner"]), user, "w")
-
-            while len(meta["chunks"]) <= idx:
-                meta["chunks"].append("")
-                meta["versions"].append(1)
-                meta["checksums"].append(0)
-                meta["sizes"].append(0)
-
-            existing_chunk_id = meta["chunks"][idx]
-
-            committed_ver = int(meta["versions"][idx]) if existing_chunk_id else 0
-
-        # UUID chunk id allocation (word-for-word chunk files named by UUID)
-        if existing_chunk_id:
-            chunk_id = existing_chunk_id
-        else:
-            chunk_id = f"chunk-{uuid.uuid4().hex}"
-
-        # version bump for overwrite; first write uses version 1
-        version = 1 if committed_ver == 0 else committed_ver + 1
-
-        ts = time.time()
-        wal_append(WAL_PATH, OP_ASSIGN, {
-            "path": path,
-            "index": idx,
-            "chunk_id": chunk_id,
-            "version": version,
-            "pipeline_node_ids": pipeline_node_ids,
-            "ts": ts,
-        })
-        _apply_assign_pending(path, idx, chunk_id, version, pipeline_node_ids, ts)
-
-        return pb.AssignChunkResponse(chunk_id=chunk_id, version=version, pipeline=pipeline)
-
-    def CommitChunk(self, request: pb.CommitChunkRequest, context) -> pb.Empty:
-        user = _caller(context)
-        path = _norm(request.path)
-        idx = int(request.index)
-        key = (path, idx)
-
-        # need write on file
-        with FILES_LOCK:
-            if path not in FILES:
-                raise RuntimeError("No such file")
-            f = FILES[path]
-            _perm_check(int(f["mode"]), str(f["owner"]), user, "w")
-
-        # validate against pending
-        with PENDING_LOCK:
-            info = PENDING.get(key)
-        if not info:
-            raise RuntimeError("Commit rejected: no pending assignment (expired or never assigned)")
-        if request.chunk_id != info["chunk_id"] or int(request.version) != int(info["version"]):
-            raise RuntimeError("Commit rejected: chunk_id/version mismatch with pending assignment")
-
-        node_ids = list(request.node_ids)
-        if len(node_ids) < REPLICATION_FACTOR:
-            raise RuntimeError("Commit rejected: replication factor not satisfied")
-
-        payload_for_wal = {
-            "path": path,
-            "index": idx,
-            "chunk_id": request.chunk_id,
-            "version": int(request.version),
-            "checksum": int(request.checksum),
-            "size": int(request.size),
-            # node_ids deliberately NOT persisted in WAL (location registry is volatile)
-        }
-
-        wal_append(WAL_PATH, OP_COMMIT, payload_for_wal)
-        _apply_commit(payload_for_wal, node_ids_for_memory=node_ids)
-        return pb.Empty()
-
-def GetFilePlan(self, request: pb.GetFilePlanRequest, context) -> pb.GetFilePlanResponse:
-    path = _norm(request.path)
-
-    with FILES_LOCK:
-        f = FILES.get(path)
-        if not f:
-            raise RuntimeError("File not found")
-        chunk_ids = list(f["chunks"])
-
-    out: List[pb.FileChunk] = []
-    committed_count = 0
-
-    for idx, cid in enumerate(chunk_ids):
-        if not cid:
-            continue
-
-        # Only publish committed chunks
-        with META_LOCK:
-            m = CHUNK_META.get(cid)
-            if not m or not m.get("committed"):
-                continue
-            ver = int(m["version"])
-            crc = int(m["checksum"])
-            size = int(m["size"])
-            committed_count += 1
-
-        # Replicas are volatile; may be empty temporarily (e.g., after restart / node churn)
-        with LOCS_LOCK:
-            node_ids = list(CHUNK_LOCS.get(cid, []))
-
-        replicas: List[pb.Endpoint] = []
-        with NODES_LOCK:
-            for nid in node_ids:
-                info = ACTIVE_NODES.get(nid)
-                if info:
-                    replicas.append(pb.Endpoint(host=info["host"], port=int(info["data_port"])))
-
-        out.append(pb.FileChunk(
-            index=int(idx),
-            chunk_id=cid,
-            version=ver,
-            checksum=crc,
-            size=size,
-            replicas=replicas,  # may be empty; client will wait/retry
-        ))
-
-    # If the file has committed chunks, we must return them (even if replicas currently empty).
-    # If there are no committed chunks at all, that's an actual error.
-    if committed_count == 0:
-        raise RuntimeError("No committed chunks available")
-
-    return pb.GetFilePlanResponse(chunks=out)
-
-
-
-def _try_acquire_lock():
-    """
-    Cross-platform best-effort leader election lock.
-    On POSIX uses fcntl.flock; on Windows uses msvcrt.locking.
-    """
-    ensure_dir(os.path.dirname(LOCK_PATH) or ".")
-    f = open(LOCK_PATH, "a+b")
     try:
         if os.name == "nt":
             import msvcrt
-            try:
-                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError:
-                f.close()
-                return None
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)  # lock 1 byte
         else:
             import fcntl
-            try:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                f.close()
-                return None
-        return f
-    except Exception:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return 0  # could not become leader
+
+    epoch = int(time.time() * 1000)
+    fh.seek(0)
+    fh.truncate()
+    fh.write(f"{os.getpid()} {epoch}\n".encode("utf-8"))
+    fh.flush()
+    os.fsync(fh.fileno())
+
+    _LEADER_LOCK_FH = fh
+    return epoch
+
+
+def _release_leader_lock():
+    global _LEADER_LOCK_FH
+    if not _LEADER_LOCK_FH:
+        return
+
+    try:
+        if os.name == "nt":
+            import msvcrt
+            _LEADER_LOCK_FH.seek(0)
+            msvcrt.locking(_LEADER_LOCK_FH.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(_LEADER_LOCK_FH.fileno(), fcntl.LOCK_UN)
+    finally:
         try:
-            f.close()
-        except Exception:
-            pass
-        return None
-
-
-def serve_as_leader() -> None:
-    recover_from_wal()
-    threading.Thread(target=dead_node_monitor_loop, daemon=True).start()
-    threading.Thread(target=passive_recovery_loop, daemon=True).start()
-    threading.Thread(target=pending_janitor_loop, daemon=True).start()
-
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=64))
-    pb_grpc.add_MasterServiceServicer_to_server(Master(), server)
-    server.add_insecure_port(f"{MASTER_HOST}:{MASTER_PORT}")
-    server.start()
-    print(f"[MASTER] LEADER listening on {MASTER_HOST}:{MASTER_PORT} RF={REPLICATION_FACTOR}")
-    server.wait_for_termination()
-
-
-def main() -> None:
-    # Standby loop: only one master holds the lock and serves => prevents split brain.
-    while True:
-        lock = _try_acquire_lock()
-        if lock is None:
-            print("[MASTER] STANDBY: waiting for leader lock...")
-            time.sleep(1.0)
-            continue
-
-        try:
-            print("[MASTER] Acquired leader lock; starting service.")
-            serve_as_leader()
-        except Exception as e:
-            print(f"[MASTER] Leader crashed/exited: {e}")
-            time.sleep(0.5)
+            _LEADER_LOCK_FH.close()
         finally:
+            _LEADER_LOCK_FH = None
+
+# -------------------------
+# WAL recovery
+# -------------------------
+def _ensure_root() -> None:
+    if "/" not in PATHS:
+        PATHS["/"] = Inode(is_dir=True, owner="root", mode=0o777, children=set(), chunks={})
+
+def _apply_mkdir(path: str, owner: str, mode: int) -> None:
+    path = _norm(path)
+    _ensure_root()
+    if path in PATHS:
+        return
+    par = _parent(path)
+    if par not in PATHS:
+        return
+    PATHS[path] = Inode(is_dir=True, owner=owner, mode=mode, children=set(), chunks={})
+    PATHS[par].children.add(_name(path))
+
+def _apply_create_file(path: str, owner: str, mode: int) -> None:
+    path = _norm(path)
+    _ensure_root()
+    if path in PATHS:
+        return
+    par = _parent(path)
+    if par not in PATHS:
+        return
+    PATHS[path] = Inode(is_dir=False, owner=owner, mode=mode, children=set(), chunks={})
+    PATHS[par].children.add(_name(path))
+
+def _apply_assign_chunk(path: str, index: int, chunk_id: str, version: int) -> None:
+    path = _norm(path)
+    if path not in PATHS:
+        return
+    inode = PATHS[path]
+    inode.chunks[index] = chunk_id
+    FILE_INDEX_TO_CHUNK[(path, index)] = chunk_id
+    if chunk_id not in CHUNKS:
+        CHUNKS[chunk_id] = ChunkRecord(chunk_id=chunk_id, version=version)
+        CHUNK_REFCOUNT[chunk_id] = CHUNK_REFCOUNT.get(chunk_id, 0) + 1
+    else:
+        CHUNKS[chunk_id].version = max(CHUNKS[chunk_id].version, version)
+
+def _apply_commit_chunk(chunk_id: str, version: int, size: int, checksum: int, replicas: List[str]) -> None:
+    if chunk_id not in CHUNKS:
+        CHUNKS[chunk_id] = ChunkRecord(chunk_id=chunk_id, version=version)
+        CHUNK_REFCOUNT[chunk_id] = CHUNK_REFCOUNT.get(chunk_id, 0) + 1
+    c = CHUNKS[chunk_id]
+    c.version = max(c.version, version)
+    c.size = size
+    c.checksum = checksum
+    c.replicas = set(replicas)
+
+def _apply_rm(path: str) -> None:
+    path = _norm(path)
+    if path not in PATHS or path == "/":
+        return
+    inode = PATHS[path]
+    # decrement refcounts for file chunks
+    if not inode.is_dir:
+        for idx, cid in list(inode.chunks.items()):
+            _dec_ref(cid)
+            inode.chunks.pop(idx, None)
+            FILE_INDEX_TO_CHUNK.pop((path, idx), None)
+    # remove from parent
+    par = _parent(path)
+    if par in PATHS:
+        PATHS[par].children.discard(_name(path))
+    # remove inode
+    del PATHS[path]
+
+def _apply_mv(src: str, dst: str) -> None:
+    src = _norm(src); dst = _norm(dst)
+    if src not in PATHS or dst in PATHS or src == "/":
+        return
+    src_inode = PATHS[src]
+    # detach
+    src_par = _parent(src)
+    if src_par in PATHS:
+        PATHS[src_par].children.discard(_name(src))
+    # attach
+    dst_par = _parent(dst)
+    if dst_par not in PATHS or not PATHS[dst_par].is_dir:
+        return
+    PATHS[dst] = src_inode
+    PATHS[dst_par].children.add(_name(dst))
+    # update chunk mappings for file
+    if not src_inode.is_dir:
+        for idx, cid in list(src_inode.chunks.items()):
+            FILE_INDEX_TO_CHUNK.pop((src, idx), None)
+            FILE_INDEX_TO_CHUNK[(dst, idx)] = cid
+    # delete old key
+    del PATHS[src]
+
+def recover() -> None:
+    _ensure_root()
+    for op, payload in wal_iter(WAL_PATH) or []:
+        try:
+            if op == OP_MKDIR:
+                _apply_mkdir(payload["path"], payload["owner"], payload["mode"])
+            elif op == OP_CREATE_FILE:
+                _apply_create_file(payload["path"], payload["owner"], payload["mode"])
+            elif op == OP_ASSIGN_CHUNK:
+                _apply_assign_chunk(payload["path"], int(payload["index"]), payload["chunk_id"], int(payload["version"]))
+            elif op == OP_COMMIT_CHUNK:
+                _apply_commit_chunk(payload["chunk_id"], int(payload["version"]), int(payload["size"]), int(payload["checksum"]), list(payload.get("replicas", [])))
+            elif op == OP_RM:
+                _apply_rm(payload["path"])
+            elif op == OP_MV:
+                _apply_mv(payload["src"], payload["dst"])
+        except Exception:
+            continue
+    print("[MASTER] WAL replay complete; replica locations will be rebuilt via block reports.", flush=True)
+
+# -------------------------
+# Refcount + GC
+# -------------------------
+def _dec_ref(chunk_id: str) -> None:
+    CHUNK_REFCOUNT[chunk_id] = CHUNK_REFCOUNT.get(chunk_id, 1) - 1
+    if CHUNK_REFCOUNT[chunk_id] <= 0:
+        CHUNK_REFCOUNT.pop(chunk_id, None)
+        GC_QUEUE.append(chunk_id)
+
+def _gc_loop() -> None:
+    while not STOP.is_set():
+        time.sleep(GC_INTERVAL)
+        with STATE_LOCK:
+            if not GC_QUEUE:
+                continue
+            chunk_id = GC_QUEUE.pop(0)
+            rec = CHUNKS.pop(chunk_id, None)
+            if not rec:
+                continue
+            replicas = list(rec.replicas)
+        # best-effort delete from known replicas
+        for node_id in replicas:
+            ni = None
+            with STATE_LOCK:
+                ni = NODES.get(node_id)
+            if not ni:
+                continue
             try:
-                lock.close()
+                ch = grpc.insecure_channel(f"{ni.host}:{ni.control_port}")
+                stub = pb_grpc.DataNodeControlStub(ch)
+                md = (("x-epoch", str(LEADER_EPOCH)),)
+                stub.DeleteChunk(pb.DeleteChunkRequest(chunk_id=chunk_id), timeout=4.0, metadata=md)
             except Exception:
                 pass
 
+# -------------------------
+# Health + repair
+# -------------------------
+def _mark_dead_nodes() -> List[str]:
+    now = time.time()
+    dead = []
+    for node_id, ni in list(NODES.items()):
+        if ni.alive and (now - ni.last_hb) > HB_TIMEOUT:
+            ni.alive = False
+            dead.append(node_id)
+    return dead
+
+def _repair_loop() -> None:
+    while not STOP.is_set():
+        time.sleep(REPAIR_INTERVAL)
+        with STATE_LOCK:
+            dead = _mark_dead_nodes()
+            if dead:
+                # remove from replica sets
+                for cid, rec in CHUNKS.items():
+                    rec.replicas.difference_update(dead)
+
+            # build list of under-replicated chunks
+            under = []
+            for cid, rec in CHUNKS.items():
+                if rec.size <= 0:
+                    continue
+                if len([n for n in rec.replicas if NODES.get(n) and NODES[n].alive]) < RF:
+                    under.append(cid)
+        for cid in under[:20]:
+            _repair_one(cid)
+
+def _repair_one(chunk_id: str) -> None:
+    with STATE_LOCK:
+        rec = CHUNKS.get(chunk_id)
+        if not rec:
+            return
+        sources = [n for n in rec.replicas if NODES.get(n) and NODES[n].alive]
+        targets = [n for n in NODES.keys() if NODES[n].alive and n not in rec.replicas]
+        if not sources or not targets:
+            return
+        src = NODES[sources[0]]
+        tgt = NODES[targets[0]]
+        version = rec.version
+    try:
+        ch = grpc.insecure_channel(f"{src.host}:{src.control_port}")
+        stub = pb_grpc.DataNodeControlStub(ch)
+        md = (("x-epoch", str(LEADER_EPOCH)),)
+        r = stub.CopyChunk(pb.CopyChunkRequest(
+            chunk_id=chunk_id,
+            version=version,
+            target_data=pb.HostPort(host=tgt.host, port=tgt.data_port),
+        ), timeout=8.0, metadata=md)
+        if r.ok:
+            with STATE_LOCK:
+                rec2 = CHUNKS.get(chunk_id)
+                if rec2:
+                    rec2.replicas.add(tgt.node_id)
+    except Exception:
+        pass
+
+# -------------------------
+# gRPC service
+# -------------------------
+class Master(pb_grpc.MasterServiceServicer):
+    def RegisterDataNode(self, request, context):
+        user = _user_from_md(context)  # unused but keeps pattern
+        host = (request.host or "").strip()
+        if not host:
+            # derive from peer
+            peer = context.peer() or ""
+            if peer.startswith("ipv4:"):
+                try:
+                    host = peer.split(":")[1]
+                except Exception:
+                    host = "127.0.0.1"
+            else:
+                host = "127.0.0.1"
+        data_port = int(request.data_port)
+        control_port = int(request.control_port)
+        node_id = f"node-{data_port}"
+
+        with STATE_LOCK:
+            NODES[node_id] = NodeInfo(node_id=node_id, host=host, data_port=data_port, control_port=control_port, last_hb=time.time(), alive=True)
+        st, _ = _ok()
+        return pb.RegisterDataNodeReply(status=st, data=pb.RegisterDataNodeResponse(node_id=node_id, epoch=LEADER_EPOCH))
+
+    def Heartbeat(self, request, context):
+        if int(request.epoch) != LEADER_EPOCH:
+            st, _ = _err("stale epoch")
+            return pb.HeartbeatReply(status=st, data=pb.HeartbeatResponse())
+        node_id = request.node_id
+        with STATE_LOCK:
+            ni = NODES.get(node_id)
+            if ni:
+                ni.last_hb = time.time()
+                ni.alive = True
+        st, _ = _ok()
+        return pb.HeartbeatReply(status=st, data=pb.HeartbeatResponse())
+
+    def BlockReport(self, request, context):
+        if int(request.epoch) != LEADER_EPOCH:
+            st, _ = _err("stale epoch")
+            return pb.BlockReportReply(status=st, data=pb.BlockReportResponse())
+        node_id = request.node_id
+        reported = dict(request.chunks)
+        deletes: List[Tuple[str,int]] = []
+        with STATE_LOCK:
+            ni = NODES.get(node_id)
+            if ni:
+                ni.last_hb = time.time()
+                ni.alive = True
+            # incorporate reports
+            for cid, ver in reported.items():
+                rec = CHUNKS.get(cid)
+                if not rec:
+                    # unknown chunk -> schedule delete
+                    deletes.append((cid, ver))
+                    continue
+                if int(ver) != rec.version:
+                    deletes.append((cid, ver))
+                    continue
+                rec.replicas.add(node_id)
+            # also: chunks master expects on node but not reported -> remove
+            for cid, rec in CHUNKS.items():
+                if node_id in rec.replicas and cid not in reported:
+                    rec.replicas.discard(node_id)
+        # best-effort delete stale/unknown on that node
+        if deletes:
+            ni = None
+            with STATE_LOCK:
+                ni = NODES.get(node_id)
+            if ni:
+                try:
+                    ch = grpc.insecure_channel(f"{ni.host}:{ni.control_port}")
+                    stub = pb_grpc.DataNodeControlStub(ch)
+                    md = (("x-epoch", str(LEADER_EPOCH)),)
+                    for cid, _ in deletes[:50]:
+                        stub.DeleteChunk(pb.DeleteChunkRequest(chunk_id=cid), timeout=4.0, metadata=md)
+                except Exception:
+                    pass
+        st, _ = _ok()
+        return pb.BlockReportReply(status=st, data=pb.BlockReportResponse())
+
+    # -------- Namespace ops --------
+    def Mkdir(self, request, context):
+        user = _user_from_md(context)
+        path = _norm(request.path)
+        mode = int(request.mode) if request.mode else 0o755
+        with STATE_LOCK:
+            _ensure_root()
+            if path in PATHS:
+                inode = PATHS[path]
+                if inode.is_dir:
+                    st, _ = _ok()
+                    return pb.MkdirReply(status=st, data=pb.MkdirResponse())
+                st, _ = _err("Path exists and is a file")
+                return pb.MkdirReply(status=st, data=pb.MkdirResponse())
+
+            par_inode, err = _require_parent_dir(path)
+            if err:
+                st, _ = _err(err)
+                return pb.MkdirReply(status=st, data=pb.MkdirResponse())
+            if not _can_exec(user, par_inode) or not _can_write(user, par_inode):
+                st, _ = _err("PermissionDenied")
+                return pb.MkdirReply(status=st, data=pb.MkdirResponse())
+
+            wal_append(WAL_PATH, OP_MKDIR, {"path": path, "owner": user, "mode": mode})
+            _apply_mkdir(path, user, mode)
+
+        st, _ = _ok()
+        return pb.MkdirReply(status=st, data=pb.MkdirResponse())
+
+    def Ls(self, request, context):
+        user = _user_from_md(context)
+        path = _norm(request.path)
+        with STATE_LOCK:
+            inode = PATHS.get(path)
+            if not inode or not inode.is_dir:
+                st, _ = _err("No such directory")
+                return pb.LsReply(status=st, data=pb.LsResponse())
+            if not _can_exec(user, inode) or not _can_read(user, inode):
+                st, _ = _err("PermissionDenied")
+                return pb.LsReply(status=st, data=pb.LsResponse())
+            entries = sorted(list(inode.children))
+        st, _ = _ok()
+        return pb.LsReply(status=st, data=pb.LsResponse(entries=entries))
+
+    def Stat(self, request, context):
+        user = _user_from_md(context)
+        path = _norm(request.path)
+        with STATE_LOCK:
+            inode = PATHS.get(path)
+            if not inode:
+                st, _ = _err("No such file")
+                return pb.StatReply(status=st, data=pb.StatResponse())
+            if not _can_read(user, inode):
+                st, _ = _err("PermissionDenied")
+                return pb.StatReply(status=st, data=pb.StatResponse())
+            if inode.is_dir:
+                st, _ = _ok()
+                return pb.StatReply(status=st, data=pb.StatResponse(is_dir=True, mode=inode.mode, owner=inode.owner, size=0, chunk_count=0))
+            # file size = sum chunk sizes
+            total = 0
+            for idx, cid in inode.chunks.items():
+                rec = CHUNKS.get(cid)
+                if rec:
+                    total += rec.size
+            st, _ = _ok()
+            return pb.StatReply(status=st, data=pb.StatResponse(is_dir=False, mode=inode.mode, owner=inode.owner, size=total, chunk_count=len(inode.chunks)))
+
+    def Rm(self, request, context):
+        user = _user_from_md(context)
+        path = _norm(request.path)
+        with STATE_LOCK:
+            if path not in PATHS or path == "/":
+                st, _ = _err("No such file")
+                return pb.RmReply(status=st, data=pb.RmResponse())
+            inode = PATHS[path]
+            par = PATHS.get(_parent(path))
+            if par and (not _can_write(user, par) or not _can_exec(user, par)):
+                st, _ = _err("PermissionDenied")
+                return pb.RmReply(status=st, data=pb.RmResponse())
+            if inode.is_dir and inode.children and not request.recursive:
+                st, _ = _err("Directory not empty")
+                return pb.RmReply(status=st, data=pb.RmResponse())
+
+            # recursive delete for dirs
+            to_delete = [path]
+            if inode.is_dir and request.recursive:
+                stack = [path]
+                while stack:
+                    cur = stack.pop()
+                    cur_inode = PATHS.get(cur)
+                    if not cur_inode or not cur_inode.is_dir:
+                        continue
+                    for child in list(cur_inode.children):
+                        cpath = cur.rstrip("/") + "/" + child if cur != "/" else "/" + child
+                        to_delete.append(cpath)
+                        if PATHS.get(cpath) and PATHS[cpath].is_dir:
+                            stack.append(cpath)
+
+            # WAL then apply deletes (files first)
+            for p in sorted(to_delete, key=lambda x: -len(x)):
+                wal_append(WAL_PATH, OP_RM, {"path": p})
+                _apply_rm(p)
+
+        st, _ = _ok()
+        return pb.RmReply(status=st, data=pb.RmResponse())
+
+    def Mv(self, request, context):
+        user = _user_from_md(context)
+        src = _norm(request.src); dst = _norm(request.dst)
+        with STATE_LOCK:
+            if src not in PATHS:
+                st, _ = _err("No such file")
+                return pb.MvReply(status=st, data=pb.MvResponse())
+            if dst in PATHS:
+                st, _ = _err("Destination exists")
+                return pb.MvReply(status=st, data=pb.MvResponse())
+            dst_par_inode, err = _require_parent_dir(dst)
+            if err:
+                st, _ = _err(err)
+                return pb.MvReply(status=st, data=pb.MvResponse())
+            if not _can_write(user, dst_par_inode) or not _can_exec(user, dst_par_inode):
+                st, _ = _err("PermissionDenied")
+                return pb.MvReply(status=st, data=pb.MvResponse())
+            wal_append(WAL_PATH, OP_MV, {"src": src, "dst": dst})
+            _apply_mv(src, dst)
+        st, _ = _ok()
+        return pb.MvReply(status=st, data=pb.MvResponse())
+
+    # -------- Chunk ops --------
+    def AssignChunk(self, request, context):
+        user = _user_from_md(context)
+        path = _norm(request.path)
+        idx = int(request.index)
+        max_size = int(request.max_size) if request.max_size else 0
+        with STATE_LOCK:
+            _ensure_root()
+            # ensure parent dir exists and writable
+            par_inode, err = _require_parent_dir(path)
+            if err:
+                st, _ = _err(err)
+                return pb.AssignChunkReply(status=st, data=pb.AssignChunkResponse())
+            if not _can_write(user, par_inode) or not _can_exec(user, par_inode):
+                st, _ = _err("PermissionDenied")
+                return pb.AssignChunkReply(status=st, data=pb.AssignChunkResponse())
+
+            if path not in PATHS:
+                wal_append(WAL_PATH, OP_CREATE_FILE, {"path": path, "owner": user, "mode": 0o644})
+                _apply_create_file(path, user, 0o644)
+
+            inode = PATHS[path]
+            if inode.is_dir:
+                st, _ = _err("Is a directory")
+                return pb.AssignChunkReply(status=st, data=pb.AssignChunkResponse())
+
+            # choose active nodes
+            active = [ni for ni in NODES.values() if ni.alive]
+            if len(active) < RF:
+                st, _ = _err("CP write denied: not enough active DataNodes for replication factor")
+                return pb.AssignChunkReply(status=st, data=pb.AssignChunkResponse())
+            # deterministic but spread: sort by port then rotate by idx
+            active.sort(key=lambda n: n.data_port)
+            rot = idx % len(active)
+            pick = (active[rot:] + active[:rot])[:RF]
+
+            # existing chunk?
+            existing_cid = inode.chunks.get(idx)
+            if existing_cid:
+                rec = CHUNKS.get(existing_cid)
+                if not rec:
+                    rec = ChunkRecord(chunk_id=existing_cid, version=1)
+                    CHUNKS[existing_cid] = rec
+                    CHUNK_REFCOUNT[existing_cid] = CHUNK_REFCOUNT.get(existing_cid, 0) + 1
+                rec.version += 1
+                version = rec.version
+                chunk_id = existing_cid
+            else:
+                chunk_id = f"chunk-{uuid.uuid4().hex}"
+                version = 1
+                wal_append(WAL_PATH, OP_ASSIGN_CHUNK, {"path": path, "index": idx, "chunk_id": chunk_id, "version": version})
+                _apply_assign_chunk(path, idx, chunk_id, version)
+
+            pipeline = [pb.HostPort(host=n.host, port=n.data_port) for n in pick]
+        st, _ = _ok()
+        return pb.AssignChunkReply(status=st, data=pb.AssignChunkResponse(chunk_id=chunk_id, version=version, pipeline=pipeline))
+
+    def CommitChunk(self, request, context):
+        user = _user_from_md(context)
+        path = _norm(request.path)
+        idx = int(request.index)
+        chunk_id = request.chunk_id
+        version = int(request.version)
+        size = int(request.size)
+        checksum = int(request.checksum)
+        # pipeline nodes by port -> node_id
+        pipeline = [(hp.host, int(hp.port)) for hp in request.pipeline]
+        with STATE_LOCK:
+            inode = PATHS.get(path)
+            if not inode or inode.is_dir:
+                st, _ = _err("No such file")
+                return pb.CommitChunkReply(status=st, data=pb.CommitChunkResponse())
+            if inode.owner != user and not _can_write(user, inode):
+                st, _ = _err("PermissionDenied")
+                return pb.CommitChunkReply(status=st, data=pb.CommitChunkResponse())
+
+            # map pipeline to node_ids
+            node_ids = []
+            for host, port in pipeline:
+                node_ids.append(f"node-{port}")
+            # WAL then apply
+            wal_append(WAL_PATH, OP_COMMIT_CHUNK, {"chunk_id": chunk_id, "version": version, "size": size, "checksum": checksum, "replicas": node_ids})
+            _apply_commit_chunk(chunk_id, version, size, checksum, node_ids)
+        st, _ = _ok()
+        return pb.CommitChunkReply(status=st, data=pb.CommitChunkResponse())
+
+    def GetFilePlan(self, request, context):
+        user = _user_from_md(context)
+        path = _norm(request.path)
+        with STATE_LOCK:
+            inode = PATHS.get(path)
+            if not inode or inode.is_dir:
+                st, _ = _err("No such file")
+                return pb.GetFilePlanReply(status=st, data=pb.GetFilePlanResponse())
+            if not _can_read(user, inode):
+                st, _ = _err("PermissionDenied")
+                return pb.GetFilePlanReply(status=st, data=pb.GetFilePlanResponse())
+            plans = []
+            total = 0
+            for idx in sorted(inode.chunks.keys()):
+                cid = inode.chunks[idx]
+                rec = CHUNKS.get(cid)
+                if not rec:
+                    continue
+                total += rec.size
+                replicas = []
+                for node_id in list(rec.replicas):
+                    ni = NODES.get(node_id)
+                    if ni and ni.alive:
+                        replicas.append(pb.HostPort(host=ni.host, port=ni.data_port))
+                plans.append(pb.ChunkPlan(index=idx, chunk_id=cid, version=rec.version, size=rec.size, checksum=rec.checksum, replicas=replicas))
+        st, _ = _ok()
+        return pb.GetFilePlanReply(status=st, data=pb.GetFilePlanResponse(size=total, chunks=plans))
+
+# -------------------------
+# Server main
+# -------------------------
+def serve():
+    global LEADER_EPOCH
+    recover()
+
+    LEADER_EPOCH = _acquire_leader_lock()
+    if not LEADER_EPOCH:
+        return
+    print("[MASTER] Acquired leader lock; starting service.", flush=True)
+
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=32))
+    pb_grpc.add_MasterServiceServicer_to_server(Master(), server)
+
+    # IMPORTANT: this while True MUST be indented inside serve()
+    while True:
+        try:
+            server.add_insecure_port(f"{MASTER_HOST}:{MASTER_PORT}")
+            break
+        except RuntimeError as e:
+            if STOP.is_set():
+                raise
+            print(f"[MASTER] bind retry {MASTER_HOST}:{MASTER_PORT}: {e}", flush=True)
+            time.sleep(0.25)
+
+    # background workers (after bind succeeds)
+    threading.Thread(target=_repair_loop, daemon=True).start()
+    threading.Thread(target=_gc_loop, daemon=True).start()
+
+    server.start()
+    print(f"[MASTER] LEADER listening on {MASTER_HOST}:{MASTER_PORT} RF={RF} epoch={LEADER_EPOCH}", flush=True)
+
+    try:
+        while not STOP.is_set():
+            time.sleep(0.5)
+    finally:
+        STOP.set()
+        server.stop(0)
+        _release_leader_lock()
 
 if __name__ == "__main__":
-    main()
+    serve()

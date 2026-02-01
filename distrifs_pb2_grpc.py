@@ -36,48 +36,58 @@ class MasterServiceStub(object):
         """
         self.RegisterDataNode = channel.unary_unary(
                 '/distrifs.MasterService/RegisterDataNode',
-                request_serializer=distrifs__pb2.RegisterRequest.SerializeToString,
-                response_deserializer=distrifs__pb2.RegisterResponse.FromString,
+                request_serializer=distrifs__pb2.RegisterDataNodeRequest.SerializeToString,
+                response_deserializer=distrifs__pb2.RegisterDataNodeReply.FromString,
                 _registered_method=True)
         self.Heartbeat = channel.unary_unary(
                 '/distrifs.MasterService/Heartbeat',
                 request_serializer=distrifs__pb2.HeartbeatRequest.SerializeToString,
-                response_deserializer=distrifs__pb2.Empty.FromString,
+                response_deserializer=distrifs__pb2.HeartbeatReply.FromString,
                 _registered_method=True)
         self.BlockReport = channel.unary_unary(
                 '/distrifs.MasterService/BlockReport',
                 request_serializer=distrifs__pb2.BlockReportRequest.SerializeToString,
-                response_deserializer=distrifs__pb2.Empty.FromString,
+                response_deserializer=distrifs__pb2.BlockReportReply.FromString,
                 _registered_method=True)
         self.Mkdir = channel.unary_unary(
                 '/distrifs.MasterService/Mkdir',
                 request_serializer=distrifs__pb2.MkdirRequest.SerializeToString,
-                response_deserializer=distrifs__pb2.Empty.FromString,
+                response_deserializer=distrifs__pb2.MkdirReply.FromString,
                 _registered_method=True)
-        self.ListDir = channel.unary_unary(
-                '/distrifs.MasterService/ListDir',
-                request_serializer=distrifs__pb2.ListDirRequest.SerializeToString,
-                response_deserializer=distrifs__pb2.ListDirResponse.FromString,
+        self.Ls = channel.unary_unary(
+                '/distrifs.MasterService/Ls',
+                request_serializer=distrifs__pb2.LsRequest.SerializeToString,
+                response_deserializer=distrifs__pb2.LsReply.FromString,
                 _registered_method=True)
         self.Stat = channel.unary_unary(
                 '/distrifs.MasterService/Stat',
                 request_serializer=distrifs__pb2.StatRequest.SerializeToString,
-                response_deserializer=distrifs__pb2.StatResponse.FromString,
+                response_deserializer=distrifs__pb2.StatReply.FromString,
+                _registered_method=True)
+        self.Rm = channel.unary_unary(
+                '/distrifs.MasterService/Rm',
+                request_serializer=distrifs__pb2.RmRequest.SerializeToString,
+                response_deserializer=distrifs__pb2.RmReply.FromString,
+                _registered_method=True)
+        self.Mv = channel.unary_unary(
+                '/distrifs.MasterService/Mv',
+                request_serializer=distrifs__pb2.MvRequest.SerializeToString,
+                response_deserializer=distrifs__pb2.MvReply.FromString,
                 _registered_method=True)
         self.AssignChunk = channel.unary_unary(
                 '/distrifs.MasterService/AssignChunk',
                 request_serializer=distrifs__pb2.AssignChunkRequest.SerializeToString,
-                response_deserializer=distrifs__pb2.AssignChunkResponse.FromString,
+                response_deserializer=distrifs__pb2.AssignChunkReply.FromString,
                 _registered_method=True)
         self.CommitChunk = channel.unary_unary(
                 '/distrifs.MasterService/CommitChunk',
                 request_serializer=distrifs__pb2.CommitChunkRequest.SerializeToString,
-                response_deserializer=distrifs__pb2.Empty.FromString,
+                response_deserializer=distrifs__pb2.CommitChunkReply.FromString,
                 _registered_method=True)
         self.GetFilePlan = channel.unary_unary(
                 '/distrifs.MasterService/GetFilePlan',
                 request_serializer=distrifs__pb2.GetFilePlanRequest.SerializeToString,
-                response_deserializer=distrifs__pb2.GetFilePlanResponse.FromString,
+                response_deserializer=distrifs__pb2.GetFilePlanReply.FromString,
                 _registered_method=True)
 
 
@@ -108,13 +118,25 @@ class MasterServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def ListDir(self, request, context):
+    def Ls(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def Stat(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Rm(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Mv(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -143,48 +165,58 @@ def add_MasterServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'RegisterDataNode': grpc.unary_unary_rpc_method_handler(
                     servicer.RegisterDataNode,
-                    request_deserializer=distrifs__pb2.RegisterRequest.FromString,
-                    response_serializer=distrifs__pb2.RegisterResponse.SerializeToString,
+                    request_deserializer=distrifs__pb2.RegisterDataNodeRequest.FromString,
+                    response_serializer=distrifs__pb2.RegisterDataNodeReply.SerializeToString,
             ),
             'Heartbeat': grpc.unary_unary_rpc_method_handler(
                     servicer.Heartbeat,
                     request_deserializer=distrifs__pb2.HeartbeatRequest.FromString,
-                    response_serializer=distrifs__pb2.Empty.SerializeToString,
+                    response_serializer=distrifs__pb2.HeartbeatReply.SerializeToString,
             ),
             'BlockReport': grpc.unary_unary_rpc_method_handler(
                     servicer.BlockReport,
                     request_deserializer=distrifs__pb2.BlockReportRequest.FromString,
-                    response_serializer=distrifs__pb2.Empty.SerializeToString,
+                    response_serializer=distrifs__pb2.BlockReportReply.SerializeToString,
             ),
             'Mkdir': grpc.unary_unary_rpc_method_handler(
                     servicer.Mkdir,
                     request_deserializer=distrifs__pb2.MkdirRequest.FromString,
-                    response_serializer=distrifs__pb2.Empty.SerializeToString,
+                    response_serializer=distrifs__pb2.MkdirReply.SerializeToString,
             ),
-            'ListDir': grpc.unary_unary_rpc_method_handler(
-                    servicer.ListDir,
-                    request_deserializer=distrifs__pb2.ListDirRequest.FromString,
-                    response_serializer=distrifs__pb2.ListDirResponse.SerializeToString,
+            'Ls': grpc.unary_unary_rpc_method_handler(
+                    servicer.Ls,
+                    request_deserializer=distrifs__pb2.LsRequest.FromString,
+                    response_serializer=distrifs__pb2.LsReply.SerializeToString,
             ),
             'Stat': grpc.unary_unary_rpc_method_handler(
                     servicer.Stat,
                     request_deserializer=distrifs__pb2.StatRequest.FromString,
-                    response_serializer=distrifs__pb2.StatResponse.SerializeToString,
+                    response_serializer=distrifs__pb2.StatReply.SerializeToString,
+            ),
+            'Rm': grpc.unary_unary_rpc_method_handler(
+                    servicer.Rm,
+                    request_deserializer=distrifs__pb2.RmRequest.FromString,
+                    response_serializer=distrifs__pb2.RmReply.SerializeToString,
+            ),
+            'Mv': grpc.unary_unary_rpc_method_handler(
+                    servicer.Mv,
+                    request_deserializer=distrifs__pb2.MvRequest.FromString,
+                    response_serializer=distrifs__pb2.MvReply.SerializeToString,
             ),
             'AssignChunk': grpc.unary_unary_rpc_method_handler(
                     servicer.AssignChunk,
                     request_deserializer=distrifs__pb2.AssignChunkRequest.FromString,
-                    response_serializer=distrifs__pb2.AssignChunkResponse.SerializeToString,
+                    response_serializer=distrifs__pb2.AssignChunkReply.SerializeToString,
             ),
             'CommitChunk': grpc.unary_unary_rpc_method_handler(
                     servicer.CommitChunk,
                     request_deserializer=distrifs__pb2.CommitChunkRequest.FromString,
-                    response_serializer=distrifs__pb2.Empty.SerializeToString,
+                    response_serializer=distrifs__pb2.CommitChunkReply.SerializeToString,
             ),
             'GetFilePlan': grpc.unary_unary_rpc_method_handler(
                     servicer.GetFilePlan,
                     request_deserializer=distrifs__pb2.GetFilePlanRequest.FromString,
-                    response_serializer=distrifs__pb2.GetFilePlanResponse.SerializeToString,
+                    response_serializer=distrifs__pb2.GetFilePlanReply.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -212,8 +244,8 @@ class MasterService(object):
             request,
             target,
             '/distrifs.MasterService/RegisterDataNode',
-            distrifs__pb2.RegisterRequest.SerializeToString,
-            distrifs__pb2.RegisterResponse.FromString,
+            distrifs__pb2.RegisterDataNodeRequest.SerializeToString,
+            distrifs__pb2.RegisterDataNodeReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -240,7 +272,7 @@ class MasterService(object):
             target,
             '/distrifs.MasterService/Heartbeat',
             distrifs__pb2.HeartbeatRequest.SerializeToString,
-            distrifs__pb2.Empty.FromString,
+            distrifs__pb2.HeartbeatReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -267,7 +299,7 @@ class MasterService(object):
             target,
             '/distrifs.MasterService/BlockReport',
             distrifs__pb2.BlockReportRequest.SerializeToString,
-            distrifs__pb2.Empty.FromString,
+            distrifs__pb2.BlockReportReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -294,7 +326,7 @@ class MasterService(object):
             target,
             '/distrifs.MasterService/Mkdir',
             distrifs__pb2.MkdirRequest.SerializeToString,
-            distrifs__pb2.Empty.FromString,
+            distrifs__pb2.MkdirReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -306,7 +338,7 @@ class MasterService(object):
             _registered_method=True)
 
     @staticmethod
-    def ListDir(request,
+    def Ls(request,
             target,
             options=(),
             channel_credentials=None,
@@ -319,9 +351,9 @@ class MasterService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/distrifs.MasterService/ListDir',
-            distrifs__pb2.ListDirRequest.SerializeToString,
-            distrifs__pb2.ListDirResponse.FromString,
+            '/distrifs.MasterService/Ls',
+            distrifs__pb2.LsRequest.SerializeToString,
+            distrifs__pb2.LsReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -348,7 +380,61 @@ class MasterService(object):
             target,
             '/distrifs.MasterService/Stat',
             distrifs__pb2.StatRequest.SerializeToString,
-            distrifs__pb2.StatResponse.FromString,
+            distrifs__pb2.StatReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Rm(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/distrifs.MasterService/Rm',
+            distrifs__pb2.RmRequest.SerializeToString,
+            distrifs__pb2.RmReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Mv(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/distrifs.MasterService/Mv',
+            distrifs__pb2.MvRequest.SerializeToString,
+            distrifs__pb2.MvReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -375,7 +461,7 @@ class MasterService(object):
             target,
             '/distrifs.MasterService/AssignChunk',
             distrifs__pb2.AssignChunkRequest.SerializeToString,
-            distrifs__pb2.AssignChunkResponse.FromString,
+            distrifs__pb2.AssignChunkReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -402,7 +488,7 @@ class MasterService(object):
             target,
             '/distrifs.MasterService/CommitChunk',
             distrifs__pb2.CommitChunkRequest.SerializeToString,
-            distrifs__pb2.Empty.FromString,
+            distrifs__pb2.CommitChunkReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -429,7 +515,7 @@ class MasterService(object):
             target,
             '/distrifs.MasterService/GetFilePlan',
             distrifs__pb2.GetFilePlanRequest.SerializeToString,
-            distrifs__pb2.GetFilePlanResponse.FromString,
+            distrifs__pb2.GetFilePlanReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -450,22 +536,22 @@ class DataNodeControlStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.ReplicateChunk = channel.unary_unary(
-                '/distrifs.DataNodeControl/ReplicateChunk',
-                request_serializer=distrifs__pb2.ReplicateChunkRequest.SerializeToString,
-                response_deserializer=distrifs__pb2.Empty.FromString,
+        self.CopyChunk = channel.unary_unary(
+                '/distrifs.DataNodeControl/CopyChunk',
+                request_serializer=distrifs__pb2.CopyChunkRequest.SerializeToString,
+                response_deserializer=distrifs__pb2.ControlStatus.FromString,
                 _registered_method=True)
         self.DeleteChunk = channel.unary_unary(
                 '/distrifs.DataNodeControl/DeleteChunk',
                 request_serializer=distrifs__pb2.DeleteChunkRequest.SerializeToString,
-                response_deserializer=distrifs__pb2.Empty.FromString,
+                response_deserializer=distrifs__pb2.ControlStatus.FromString,
                 _registered_method=True)
 
 
 class DataNodeControlServicer(object):
     """Missing associated documentation comment in .proto file."""
 
-    def ReplicateChunk(self, request, context):
+    def CopyChunk(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -480,15 +566,15 @@ class DataNodeControlServicer(object):
 
 def add_DataNodeControlServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'ReplicateChunk': grpc.unary_unary_rpc_method_handler(
-                    servicer.ReplicateChunk,
-                    request_deserializer=distrifs__pb2.ReplicateChunkRequest.FromString,
-                    response_serializer=distrifs__pb2.Empty.SerializeToString,
+            'CopyChunk': grpc.unary_unary_rpc_method_handler(
+                    servicer.CopyChunk,
+                    request_deserializer=distrifs__pb2.CopyChunkRequest.FromString,
+                    response_serializer=distrifs__pb2.ControlStatus.SerializeToString,
             ),
             'DeleteChunk': grpc.unary_unary_rpc_method_handler(
                     servicer.DeleteChunk,
                     request_deserializer=distrifs__pb2.DeleteChunkRequest.FromString,
-                    response_serializer=distrifs__pb2.Empty.SerializeToString,
+                    response_serializer=distrifs__pb2.ControlStatus.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -502,7 +588,7 @@ class DataNodeControl(object):
     """Missing associated documentation comment in .proto file."""
 
     @staticmethod
-    def ReplicateChunk(request,
+    def CopyChunk(request,
             target,
             options=(),
             channel_credentials=None,
@@ -515,9 +601,9 @@ class DataNodeControl(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/distrifs.DataNodeControl/ReplicateChunk',
-            distrifs__pb2.ReplicateChunkRequest.SerializeToString,
-            distrifs__pb2.Empty.FromString,
+            '/distrifs.DataNodeControl/CopyChunk',
+            distrifs__pb2.CopyChunkRequest.SerializeToString,
+            distrifs__pb2.ControlStatus.FromString,
             options,
             channel_credentials,
             insecure,
@@ -544,7 +630,7 @@ class DataNodeControl(object):
             target,
             '/distrifs.DataNodeControl/DeleteChunk',
             distrifs__pb2.DeleteChunkRequest.SerializeToString,
-            distrifs__pb2.Empty.FromString,
+            distrifs__pb2.ControlStatus.FromString,
             options,
             channel_credentials,
             insecure,

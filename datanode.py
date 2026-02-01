@@ -1,310 +1,102 @@
+# datanode.py - DistriFS DataNode (chunk server)
+from __future__ import annotations
+
 import os
-import sys
 import time
-import socket
 import threading
+import socket
 import zlib
 import pickle
-from typing import Any, Dict, Optional, Tuple, List
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
 
 import grpc
 from concurrent import futures
 
-from utils import (
-    send_msg, recv_msg, recv_exact, atomic_write, ensure_dir, storage_root, ensure_proto_generated
-)
+from utils import ensure_proto_generated, send_msg, recv_msg, recv_exact, atomic_write, storage_root
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-os.chdir(BASE_DIR)
-if BASE_DIR not in sys.path:
-    sys.path.insert(0, BASE_DIR)
-os.environ.setdefault("PYTHONNOUSERSITE", "1")
+ensure_proto_generated(force=bool(os.getenv("DISTRIFS_FORCE_PROTO")))
 
-ensure_proto_generated()
+import distrifs_pb2 as pb
+import distrifs_pb2_grpc as pb_grpc
 
-def _load_local(modname: str, filename: str):
-    path = os.path.join(BASE_DIR, filename)
-    spec = importlib.util.spec_from_file_location(modname, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[modname] = module
-    assert spec and spec.loader
-    spec.loader.exec_module(module)
-    return module
+if os.name == "nt" and os.getenv("DISTRIFS_IGNORE_CTRL_C") == "1":
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(None, True)
+    except Exception:
+        pass
 
-pb = _load_local("distrifs_pb2", "distrifs_pb2.py")
-pb_grpc = _load_local("distrifs_pb2_grpc", "distrifs_pb2_grpc.py") 
-
-
+# -------------------------
+# Configuration
+# -------------------------
+HOST = os.getenv("DISTRIFS_DATANODE_HOST", "127.0.0.1")
 MASTER_HOST = os.getenv("DISTRIFS_MASTER_HOST", "127.0.0.1")
 MASTER_PORT = int(os.getenv("DISTRIFS_MASTER_PORT", "9000"))
 
-HEARTBEAT_INTERVAL = int(os.getenv("DISTRIFS_HEARTBEAT_INTERVAL", "3"))
-BLOCK_REPORT_INTERVAL = int(os.getenv("DISTRIFS_BLOCK_REPORT_INTERVAL", "30"))
+DATA_PORT = int(os.getenv("DISTRIFS_DATANODE_DATA_PORT", "9101"))
+CTRL_PORT = int(os.getenv("DISTRIFS_DATANODE_CTRL_PORT", "9201"))
 
-SOCKET_BACKLOG = int(os.getenv("DISTRIFS_SOCKET_BACKLOG", "200"))
+DATA_DIR = os.getenv("DISTRIFS_STORAGE_DIR")
+if not DATA_DIR:
+    DATA_DIR = os.path.join(storage_root(), f"node-{DATA_PORT}")
 
-DATA_PORT = None
-CONTROL_PORT = None
-NODE_ID = None
-DATA_DIR = None
+HB_INTERVAL = float(os.getenv("DISTRIFS_HB_INTERVAL_S", "3.0"))
+BR_INTERVAL = float(os.getenv("DISTRIFS_BLOCKREPORT_INTERVAL_S", "30.0"))
 
-CHUNKS: Dict[str, Dict[str, Any]] = {}  # chunk_id -> {version, checksum, size}
-CHUNKS_LOCK = threading.Lock()
+# -------------------------
+# Local state
+# -------------------------
+NODE_ID = f"node-{DATA_PORT}"
+EPOCH_SEEN = 0
+EPOCH_LOCK = threading.Lock()
+STOP = threading.Event()
 
+def _chunk_path(chunk_id: str) -> str:
+    return os.path.join(DATA_DIR, chunk_id)
 
-def _chunk_paths(chunk_id: str) -> Tuple[str, str]:
-    fp = os.path.join(DATA_DIR, chunk_id)
-    mp = fp + ".meta"
-    return fp, mp
+def _meta_path(chunk_id: str) -> str:
+    return os.path.join(DATA_DIR, chunk_id + ".meta")
 
-
-def _write_meta(chunk_id: str, meta: Dict[str, Any]) -> None:
-    _, mp = _chunk_paths(chunk_id)
-    atomic_write(mp, pickle.dumps(meta, protocol=pickle.HIGHEST_PROTOCOL))
-
-
-def _read_meta_path(meta_path: str) -> Dict[str, Any]:
-    with open(meta_path, "rb") as f:
-        return pickle.loads(f.read())
-
-
-def _read_meta(chunk_id: str) -> Dict[str, Any]:
-    _, mp = _chunk_paths(chunk_id)
-    return _read_meta_path(mp)
-
-
-def cleanup_tmp_files() -> None:
-    # remove leftover *.tmp from partial writes
+def _load_meta(chunk_id: str) -> Optional[Dict]:
     try:
-        for name in os.listdir(DATA_DIR):
-            if name.endswith(".tmp"):
-                try:
-                    os.remove(os.path.join(DATA_DIR, name))
-                except Exception:
-                    pass
+        with open(_meta_path(chunk_id), "rb") as f:
+            return pickle.loads(f.read())
     except Exception:
-        pass
+        return None
 
+def _save_meta(chunk_id: str, meta: Dict) -> None:
+    atomic_write(_meta_path(chunk_id), pickle.dumps(meta, protocol=pickle.HIGHEST_PROTOCOL))
 
-def scan_chunks_from_disk() -> Dict[str, Dict[str, Any]]:
-    """
-    Required by spec: block report must scan local disks and report full list.
-    Returns chunk_id -> {version, checksum, size} derived from *.meta on disk.
-    """
-    out: Dict[str, Dict[str, Any]] = {}
+def _verify_fence(md) -> bool:
+    global EPOCH_SEEN
     try:
-        for name in os.listdir(DATA_DIR):
-            if name.endswith(".meta") or name.endswith(".tmp"):
-                continue
-            fp = os.path.join(DATA_DIR, name)
-            mp = fp + ".meta"
-            if not os.path.exists(fp) or not os.path.exists(mp):
-                continue
-            try:
-                meta = _read_meta_path(mp)
-                out[name] = {
-                    "version": int(meta["version"]),
-                    "checksum": int(meta["checksum"]),
-                    "size": int(meta["size"]),
-                }
-            except Exception:
-                continue
+        epoch = int(dict(md).get("x-epoch", "0"))
     except Exception:
-        pass
-    return out
+        epoch = 0
+    with EPOCH_LOCK:
+        if epoch < EPOCH_SEEN:
+            return False
+        if epoch > EPOCH_SEEN:
+            EPOCH_SEEN = epoch
+    return True
 
-
-def load_existing_chunks() -> None:
-    ensure_dir(DATA_DIR)
-    cleanup_tmp_files()
-    disk = scan_chunks_from_disk()
-    with CHUNKS_LOCK:
-        CHUNKS.clear()
-        CHUNKS.update(disk)
-    print(f"[DATANODE {DATA_PORT}] Loaded {len(disk)} chunks from disk.")
-
-
-def master_stub() -> pb_grpc.MasterServiceStub:
-    ch = grpc.insecure_channel(f"{MASTER_HOST}:{MASTER_PORT}")
-    return pb_grpc.MasterServiceStub(ch)
-
-
-def register_with_master() -> str:
-    while True:
-        try:
-            stub = master_stub()
-            resp = stub.RegisterDataNode(
-                pb.RegisterRequest(data_port=int(DATA_PORT), control_port=int(CONTROL_PORT)),
-                timeout=6.0,
-            )
-            return resp.node_id
-        except Exception as e:
-            print(f"[DATANODE {DATA_PORT}] Register failed: {e} (retry)")
-            time.sleep(1.5)
-
-
-def heartbeat_loop() -> None:
-    stub = master_stub()
-    while True:
-        time.sleep(HEARTBEAT_INTERVAL)
-        try:
-            stub.Heartbeat(pb.HeartbeatRequest(node_id=NODE_ID), timeout=4.0)
-        except Exception as e:
-            print(f"[DATANODE {DATA_PORT}] Heartbeat error: {e}")
-
-
-def block_report_loop() -> None:
-    stub = master_stub()
-    while True:
-        time.sleep(BLOCK_REPORT_INTERVAL)
-
-        # Required: scan disk each time.
-        disk = scan_chunks_from_disk()
-        with CHUNKS_LOCK:
-            CHUNKS.clear()
-            CHUNKS.update(disk)
-
-        cvs = [pb.ChunkVersion(chunk_id=cid, version=int(meta["version"])) for cid, meta in disk.items()]
-        try:
-            stub.BlockReport(pb.BlockReportRequest(node_id=NODE_ID, chunks=cvs), timeout=10.0)
-        except Exception as e:
-            print(f"[DATANODE {DATA_PORT}] Block report error: {e}")
-
-
-def delete_chunk_local(chunk_id: str) -> None:
-    fp, mp = _chunk_paths(chunk_id)
-    with CHUNKS_LOCK:
-        CHUNKS.pop(chunk_id, None)
-    try:
-        if os.path.exists(fp):
-            os.remove(fp)
-        if os.path.exists(mp):
-            os.remove(mp)
-    except Exception:
-        pass
-    print(f"[DATANODE {DATA_PORT}] Deleted {chunk_id}")
-
-
-def read_and_verify(chunk_id: str) -> Tuple[bytes, Dict[str, Any]]:
-    fp, mp = _chunk_paths(chunk_id)
-    if not os.path.exists(fp) or not os.path.exists(mp):
-        raise FileNotFoundError("Chunk missing")
-    meta = _read_meta(chunk_id)
-    with open(fp, "rb") as f:
-        data = f.read()
-    expected = int(meta["checksum"])
-    actual = zlib.crc32(data) & 0xFFFFFFFF
-    if actual != expected:
-        raise RuntimeError(f"DataCorrupt: expected {expected}, got {actual}")
-    return data, {"version": int(meta["version"]), "checksum": expected, "size": int(meta["size"])}
-
-
-def write_stream_atomically(
-    chunk_id: str,
-    version: int,
-    size: int,
-    src: socket.socket,
-    forward: Optional[socket.socket],
-) -> Dict[str, Any]:
-    fp, _ = _chunk_paths(chunk_id)
-    tmp = fp + ".tmp"
-
-    received = 0
-    crc = 0
-
-    with open(tmp, "wb") as f:
-        while received < size:
-            buf = src.recv(min(65536, size - received))
-            if not buf:
-                raise ConnectionError("stream closed during STORE_STREAM")
-            received += len(buf)
-            f.write(buf)
-            crc = zlib.crc32(buf, crc)
-            if forward is not None:
-                forward.sendall(buf)
-
-        f.flush()
-        os.fsync(f.fileno())
-
-    crc &= 0xFFFFFFFF
-    os.replace(tmp, fp)
-
-    meta = {"version": int(version), "checksum": int(crc), "size": int(size)}
-    _write_meta(chunk_id, meta)
-
-    with CHUNKS_LOCK:
-        CHUNKS[chunk_id] = {"version": int(version), "checksum": int(crc), "size": int(size)}
-    return meta
-
-
-# -----------------------------
-# Data plane TCP server
-# -----------------------------
-def handle_data_conn(conn: socket.socket, addr) -> None:
+# -------------------------
+# Data-plane server
+# -------------------------
+def _handle_conn(conn: socket.socket, addr) -> None:
     try:
         hdr = recv_msg(conn)
         op = hdr.get("op")
-
-        if op == "STORE_STREAM":
-            chunk_id = hdr["chunk_id"]
-            version = int(hdr["version"])
-            size = int(hdr["size"])
-            replicate_to = hdr.get("replicate_to", [])  # list of [host,port]
-
-            # Reject stale version
-            with CHUNKS_LOCK:
-                cur = CHUNKS.get(chunk_id)
-                if cur and int(version) < int(cur["version"]):
-                    send_msg(conn, {"status": "err", "error": "stale_version_rejected"})
-                    return
-
-            forward = None
-            downstream_acked: List[str] = []
-            if replicate_to:
-                nh, np = replicate_to[0]
-                rest = replicate_to[1:]
-                forward = socket.create_connection((nh, int(np)), timeout=12)
-                forward.settimeout(12)
-                send_msg(forward, {
-                    "op": "STORE_STREAM",
-                    "chunk_id": chunk_id,
-                    "version": version,
-                    "size": size,
-                    "replicate_to": rest,
-                })
-
-            meta = write_stream_atomically(chunk_id, version, size, conn, forward)
-
-            # pipeline ACK: downstream -> upstream -> client
-            if forward is not None:
-                down = recv_msg(forward)
-                forward.close()
-                if down.get("status") != "ok":
-                    send_msg(conn, {"status": "err", "error": f"downstream_failed:{down.get('error')}"})
-                    return
-                downstream_acked = list(down.get("acked_nodes", []))
-
-            acked = [NODE_ID] + downstream_acked
-            send_msg(conn, {"status": "ok", "meta": meta, "acked_nodes": acked})
-            return
-
-        if op == "READ":
-            chunk_id = hdr["chunk_id"]
-            try:
-                data, meta = read_and_verify(chunk_id)
-                send_msg(conn, {"status": "ok", **meta})
-                conn.sendall(data)
-            except Exception as e:
-                msg = str(e)
-                code = "CORRUPT" if "DataCorrupt" in msg else "ERR"
-                send_msg(conn, {"status": "err", "code": code, "error": msg})
-            return
-
-        send_msg(conn, {"status": "err", "error": "unknown_op"})
-
+        if op == "PUT" or op == "REPL":
+            _handle_put(conn, hdr)
+        elif op == "GET":
+            _handle_get(conn, hdr)
+        else:
+            send_msg(conn, {"ok": False, "err": f"unknown op {op}"})
     except Exception as e:
         try:
-            send_msg(conn, {"status": "err", "error": str(e)})
+            send_msg(conn, {"ok": False, "err": str(e)})
         except Exception:
             pass
     finally:
@@ -313,86 +105,303 @@ def handle_data_conn(conn: socket.socket, addr) -> None:
         except Exception:
             pass
 
+def _stream_to_next(forward_to: List[Tuple[str,int]], hdr: Dict) -> Optional[socket.socket]:
+    if not forward_to:
+        return None
+    nh, np = forward_to[0]
+    rest = forward_to[1:]
+    s = socket.create_connection((nh, np), timeout=6.0)
+    h2 = dict(hdr)
+    h2["forward_to"] = rest
+    send_msg(s, h2)
+    return s
 
-def data_plane_server() -> None:
+def _handle_put(conn: socket.socket, hdr: Dict) -> None:
+    chunk_id = hdr["chunk_id"]
+    version = int(hdr.get("version", 1))
+    size = int(hdr["size"])
+    forward_to = hdr.get("forward_to") or []
+    # forward_to elements may be pb HostPorts (converted) or tuples
+    fwd: List[Tuple[str,int]] = []
+    for x in forward_to:
+        if isinstance(x, tuple):
+            fwd.append((x[0], int(x[1])))
+        elif isinstance(x, dict):
+            fwd.append((x["host"], int(x["port"])))
+        else:
+            # assume (host,port) list-like
+            fwd.append((x[0], int(x[1])))
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp_path = _chunk_path(chunk_id) + ".tmp"
+    out = open(tmp_path, "wb")
+
+    next_sock = None
+    try:
+        next_sock = _stream_to_next(fwd, hdr) if fwd else None
+    except Exception:
+        next_sock = None
+
+    crc = 0
+    remaining = size
+    try:
+        while remaining > 0:
+            n = 64 * 1024 if remaining > 64 * 1024 else remaining
+            data = recv_exact(conn, n)
+            out.write(data)
+            crc = zlib.crc32(data, crc)
+            remaining -= n
+            if next_sock is not None:
+                next_sock.sendall(data)
+        out.flush()
+        os.fsync(out.fileno())
+        out.close()
+
+        # wait downstream ack first (pipeline acks)
+        if next_sock is not None:
+            ack = recv_msg(next_sock)
+            try:
+                next_sock.close()
+            except Exception:
+                pass
+            if not ack.get("ok", False):
+                send_msg(conn, {"ok": False, "err": ack.get("err", "downstream failed")})
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+                return
+
+        # finalize locally
+        final_path = _chunk_path(chunk_id)
+        os.replace(tmp_path, final_path)
+        _save_meta(chunk_id, {"version": version, "size": size, "checksum": int(crc) & 0xFFFFFFFF})
+        send_msg(conn, {"ok": True, "checksum": int(crc) & 0xFFFFFFFF, "version": version})
+    except Exception as e:
+        try:
+            out.close()
+        except Exception:
+            pass
+        try:
+            if next_sock is not None:
+                next_sock.close()
+        except Exception:
+            pass
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        send_msg(conn, {"ok": False, "err": str(e)})
+
+def _handle_get(conn: socket.socket, hdr: Dict) -> None:
+    chunk_id = hdr["chunk_id"]
+    want_version = int(hdr.get("version", 0))
+    meta = _load_meta(chunk_id)
+    if not meta:
+        send_msg(conn, {"ok": False, "err": "NoSuchChunk"})
+        return
+    if want_version and int(meta.get("version", 0)) != want_version:
+        send_msg(conn, {"ok": False, "err": "StaleChunk"})
+        return
+    path = _chunk_path(chunk_id)
+    try:
+        with open(path, "rb") as f:
+            # verify checksum
+            crc = 0
+            while True:
+                data = f.read(256 * 1024)
+                if not data:
+                    break
+                crc = zlib.crc32(data, crc)
+            if (int(crc) & 0xFFFFFFFF) != int(meta.get("checksum", 0)):
+                send_msg(conn, {"ok": False, "err": "DataCorrupt"})
+                return
+
+        # stream again (avoid holding all in memory)
+        size = int(meta.get("size", 0))
+        send_msg(conn, {"ok": True, "size": size})
+        with open(path, "rb") as f:
+            while True:
+                data = f.read(256 * 1024)
+                if not data:
+                    break
+                conn.sendall(data)
+    except Exception as e:
+        send_msg(conn, {"ok": False, "err": str(e)})
+
+def _data_server() -> None:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("0.0.0.0", int(DATA_PORT)))
-    s.listen(SOCKET_BACKLOG)
-    print(f"[DATANODE {DATA_PORT}] Data-plane on 0.0.0.0:{DATA_PORT}")
-    while True:
-        c, addr = s.accept()
-        threading.Thread(target=handle_data_conn, args=(c, addr), daemon=True).start()
+    s.bind((HOST, DATA_PORT))
+    s.listen(64)
+    print(f"[DATANODE] data-plane listening on {HOST}:{DATA_PORT} dir={DATA_DIR}", flush=True)
+    s.settimeout(0.5)
+    while not STOP.is_set():
+        try:
+            conn, addr = s.accept()
+        except socket.timeout:
+            continue
+        threading.Thread(target=_handle_conn, args=(conn, addr), daemon=True).start()
+    try:
+        s.close()
+    except Exception:
+        pass
 
-
-# -----------------------------
-# Control plane gRPC server
-# -----------------------------
+# -------------------------
+# Control-plane service
+# -------------------------
 class Control(pb_grpc.DataNodeControlServicer):
-    def ReplicateChunk(self, request: pb.ReplicateChunkRequest, context) -> pb.Empty:
+    def CopyChunk(self, request, context):
+        if not _verify_fence(context.invocation_metadata()):
+            return pb.ControlStatus(ok=False, message="fenced")
         chunk_id = request.chunk_id
-        version = int(request.version)
-        target = request.target
+        want_version = int(request.version)
+        meta = _load_meta(chunk_id)
+        if not meta:
+            return pb.ControlStatus(ok=False, message="no such chunk")
+        if int(meta.get("version", 0)) != want_version:
+            return pb.ControlStatus(ok=False, message="stale version")
+        target = request.target_data
+        # connect and send replication PUT (op REPL)
+        try:
+            path = _chunk_path(chunk_id)
+            size = int(meta.get("size", 0))
+            hdr = {"op": "REPL", "chunk_id": chunk_id, "version": want_version, "size": size, "forward_to": []}
+            sock = socket.create_connection((target.host, int(target.port)), timeout=6.0)
+            send_msg(sock, hdr)
+            with open(path, "rb") as f:
+                while True:
+                    data = f.read(256 * 1024)
+                    if not data:
+                        break
+                    sock.sendall(data)
+            ack = recv_msg(sock)
+            sock.close()
+            if not ack.get("ok", False):
+                return pb.ControlStatus(ok=False, message="target failed")
+            return pb.ControlStatus(ok=True, message="ok")
+        except Exception as e:
+            return pb.ControlStatus(ok=False, message=str(e))
 
-        # read local and verify integrity
-        data, meta = read_and_verify(chunk_id)
+    def DeleteChunk(self, request, context):
+        if not _verify_fence(context.invocation_metadata()):
+            return pb.ControlStatus(ok=False, message="fenced")
+        chunk_id = request.chunk_id
+        try:
+            p = _chunk_path(chunk_id)
+            m = _meta_path(chunk_id)
+            if os.path.exists(p):
+                os.remove(p)
+            if os.path.exists(m):
+                os.remove(m)
+            return pb.ControlStatus(ok=True, message="ok")
+        except Exception as e:
+            return pb.ControlStatus(ok=False, message=str(e))
 
-        # push to target's data port as terminal STORE_STREAM
-        with socket.create_connection((target.host, int(target.port)), timeout=12) as s:
-            s.settimeout(12)
-            send_msg(s, {
-                "op": "STORE_STREAM",
-                "chunk_id": chunk_id,
-                "version": version,
-                "size": int(meta["size"]),
-                "replicate_to": [],
-            })
-            if data:
-                s.sendall(data)
-            resp = recv_msg(s)
-            if resp.get("status") != "ok":
-                raise RuntimeError(resp.get("error", "replication_failed"))
-
-        return pb.Empty()
-
-    def DeleteChunk(self, request: pb.DeleteChunkRequest, context) -> pb.Empty:
-        delete_chunk_local(request.chunk_id)
-        return pb.Empty()
-
-
-def control_plane_server() -> None:
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=32))
+def _ctrl_server() -> grpc.Server:
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
     pb_grpc.add_DataNodeControlServicer_to_server(Control(), server)
-    server.add_insecure_port(f"0.0.0.0:{int(CONTROL_PORT)}")
+    server.add_insecure_port(f"{HOST}:{CTRL_PORT}")
     server.start()
-    print(f"[DATANODE {DATA_PORT}] Control-plane on 0.0.0.0:{CONTROL_PORT}")
-    server.wait_for_termination()
+    print(f"[DATANODE] control-plane listening on {HOST}:{CTRL_PORT}", flush=True)
+    return server
 
+# -------------------------
+# Master registration + heartbeats + block reports
+# -------------------------
+def _master_stub():
+    ch = grpc.insecure_channel(f"{MASTER_HOST}:{MASTER_PORT}")
+    return pb_grpc.MasterServiceStub(ch)
 
-def main() -> None:
-    global DATA_PORT, CONTROL_PORT, NODE_ID, DATA_DIR
-    if len(sys.argv) != 3:
-        print("Usage: python datanode.py <data_port> <control_port>")
-        sys.exit(1)
+def _register() -> int:
+    global EPOCH_SEEN
+    stub = _master_stub()
+    r = stub.RegisterDataNode(pb.RegisterDataNodeRequest(host=HOST, data_port=DATA_PORT, control_port=CTRL_PORT), timeout=6.0)
+    if not r.status.ok:
+        raise RuntimeError(r.status.error.message if r.status.error else "register failed")
+    with EPOCH_LOCK:
+        EPOCH_SEEN = int(r.data.epoch)
+    return EPOCH_SEEN
 
-    DATA_PORT = int(sys.argv[1])
-    CONTROL_PORT = int(sys.argv[2])
+def _hb_loop():
+    while not STOP.is_set():
+        time.sleep(HB_INTERVAL)
+        try:
+            stub = _master_stub()
+            with EPOCH_LOCK:
+                epoch = EPOCH_SEEN
+            r = stub.Heartbeat(pb.HeartbeatRequest(node_id=NODE_ID, epoch=epoch), timeout=4.0)
+            if not r.status.ok:
+                # stale epoch -> re-register
+                _register()
+        except Exception:
+            # try re-register
+            try:
+                _register()
+            except Exception:
+                pass
 
-    # Practical multi-process demo: each DN gets its own subdir,
-    # but chunk filenames remain UUIDs: node-<port>/chunk-<uuid>
-    DATA_DIR = os.path.join(storage_root(), f"node-{DATA_PORT}")
-    ensure_dir(DATA_DIR)
-    load_existing_chunks()
+def _scan_chunks() -> Dict[str, int]:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    out: Dict[str, int] = {}
+    for name in os.listdir(DATA_DIR):
+        if not name.startswith("chunk-"):
+            continue
+        if name.endswith(".meta") or name.endswith(".tmp"):
+            continue
+        meta = _load_meta(name)
+        if not meta:
+            continue
+        out[name] = int(meta.get("version", 0))
+    return out
 
-    NODE_ID = register_with_master()
-    print(f"[DATANODE {DATA_PORT}] Registered as {NODE_ID}")
+def _br_loop():
+    while not STOP.is_set():
+        time.sleep(BR_INTERVAL)
+        try:
+            stub = _master_stub()
+            with EPOCH_LOCK:
+                epoch = EPOCH_SEEN
+            chunks = _scan_chunks()
+            r = stub.BlockReport(pb.BlockReportRequest(node_id=NODE_ID, epoch=epoch, chunks=chunks), timeout=8.0)
+            if not r.status.ok:
+                _register()
+        except Exception:
+            pass
 
-    threading.Thread(target=heartbeat_loop, daemon=True).start()
-    threading.Thread(target=block_report_loop, daemon=True).start()
+# -------------------------
+# Entry
+# -------------------------
+def serve():
+    # args override ports
+    import sys
+    global DATA_PORT, CTRL_PORT, NODE_ID, DATA_DIR
+    if len(sys.argv) >= 2:
+        DATA_PORT = int(sys.argv[1])
+    if len(sys.argv) >= 3:
+        CTRL_PORT = int(sys.argv[2])
+    NODE_ID = f"node-{DATA_PORT}"
+    DATA_DIR = os.getenv("DISTRIFS_STORAGE_DIR") or os.path.join(storage_root(), f"node-{DATA_PORT}")
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-    threading.Thread(target=data_plane_server, daemon=True).start()
-    control_plane_server()
+    # start servers
+    ctrl = _ctrl_server()
+    t = threading.Thread(target=_data_server, daemon=True)
+    t.start()
 
+    # register
+    _register()
+    threading.Thread(target=_hb_loop, daemon=True).start()
+    threading.Thread(target=_br_loop, daemon=True).start()
+
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        STOP.set()
+        ctrl.stop(0)
 
 if __name__ == "__main__":
-    main()
+    serve()

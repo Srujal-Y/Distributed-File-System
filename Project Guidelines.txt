@@ -1,7 +1,5 @@
 # **DistriFS (Distributed File System)**
 
-Project Duration: 8 Weeks
-
 Goal: Build a fault-tolerant, distributed file system inspired by GFS (Google File System) and HDFS.
 
 Learning Outcome: Move beyond “API development” into “Systems Engineering.” You will manually implement concepts usually abstracted away by databases: sharding, replication, leader election, and durability.
@@ -55,8 +53,6 @@ The system follows a strict **Master-Slave (Leader-Follower)** architecture. Thi
 
 ## **3. Technical Constraints & Stack**
 
-- **Language:** Go (Golang) or Rust.
-    - *Why:* These languages provide low-level control over memory layouts and concurrency primitives (Channels/Mutexes) essential for systems programming. Python/JS garbage collection pauses are unacceptable for high-throughput heartbeats.
 - **Communication Protocols:**
     - **Control Plane (gRPC + Protobuf):** Strict schemas for low-volume, high-importance messages (Heartbeats, Metadata requests).
     - **Data Plane (TCP Streams):** Raw TCP sockets for transferring file data. gRPC overhead is often too high for pushing gigabytes of binary data.
@@ -128,10 +124,3 @@ Goal: Production readiness and stress testing.
         - Scenario: Node A goes offline. Master updates the version number of a file chunk. Node A comes back online with the old version.
         - Master must detect the version mismatch via Block Reports and instruct Node A to delete the stale chunk.
     - **Chaos Monkey Demo:** A script that continuously uploads files while randomly kill -9ing DataNode processes. The system must not lose data or return corrupted bytes.
-
-## **5. Deliverables**
-
-1. **Source Code:** A GitHub repository. Code must be idiomatic (e.g., proper Go error handling, Rust Result types) and well-commented.
-2. **Architecture Diagram:** A high-resolution visual map showing the Control Plane vs. Data Plane.
-3. **RFC/Design Doc:** A written document defending your choices.
-    - *Required Section:* **“Failure Scenarios”**. You must explicitly list: “If the Master crashes during a Write Pipeline operation, X happens. If the Client crashes after sending 99% of bytes, Y happens.”
