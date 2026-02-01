@@ -105,6 +105,15 @@ message CommitChunkReply { Status status = 1; CommitChunkResponse data = 2; }
 
 message GetFilePlanRequest { string path = 1; }
 
+message GetChunkLocationRequest {
+  string path = 1;
+  int32 index = 2;
+}
+
+message GetChunkLocationResponse {
+  ChunkPlan chunk = 1;
+}
+
 message ChunkPlan {
   int32 index = 1;
   string chunk_id = 2;
@@ -120,6 +129,7 @@ message GetFilePlanResponse {
 }
 
 message GetFilePlanReply { Status status = 1; GetFilePlanResponse data = 2; }
+message GetChunkLocationReply { Status status = 1; GetChunkLocationResponse data = 2; }
 
 // ---------- Master -> DataNode control (repair + gc + fencing) ----------
 message CopyChunkRequest {
@@ -133,6 +143,27 @@ message DeleteChunkRequest { string chunk_id = 1; }
 message DeleteChunkResponse {}
 
 message ControlStatus { bool ok = 1; string message = 2; }
+
+// ---------- Master <-> Master (leader election) ----------
+message RequestVoteRequest {
+  int64 term = 1;
+  string candidate_id = 2;
+}
+
+message RequestVoteResponse {
+  int64 term = 1;
+  bool vote_granted = 2;
+}
+
+message AppendEntriesRequest {
+  int64 term = 1;
+  string leader_id = 2;
+}
+
+message AppendEntriesResponse {
+  int64 term = 1;
+  bool success = 2;
+}
 
 service MasterService {
   rpc RegisterDataNode(RegisterDataNodeRequest) returns (RegisterDataNodeReply);
@@ -148,10 +179,14 @@ service MasterService {
   rpc AssignChunk(AssignChunkRequest) returns (AssignChunkReply);
   rpc CommitChunk(CommitChunkRequest) returns (CommitChunkReply);
   rpc GetFilePlan(GetFilePlanRequest) returns (GetFilePlanReply);
+  rpc GetChunkLocation(GetChunkLocationRequest) returns (GetChunkLocationReply);
+
+  // Leader election RPCs (Raft-style heartbeats + voting)
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
 }
 
 service DataNodeControl {
   rpc CopyChunk(CopyChunkRequest) returns (ControlStatus);
   rpc DeleteChunk(DeleteChunkRequest) returns (ControlStatus);
 }
-

@@ -89,6 +89,21 @@ class MasterServiceStub(object):
                 request_serializer=distrifs__pb2.GetFilePlanRequest.SerializeToString,
                 response_deserializer=distrifs__pb2.GetFilePlanReply.FromString,
                 _registered_method=True)
+        self.GetChunkLocation = channel.unary_unary(
+                '/distrifs.MasterService/GetChunkLocation',
+                request_serializer=distrifs__pb2.GetChunkLocationRequest.SerializeToString,
+                response_deserializer=distrifs__pb2.GetChunkLocationReply.FromString,
+                _registered_method=True)
+        self.RequestVote = channel.unary_unary(
+                '/distrifs.MasterService/RequestVote',
+                request_serializer=distrifs__pb2.RequestVoteRequest.SerializeToString,
+                response_deserializer=distrifs__pb2.RequestVoteResponse.FromString,
+                _registered_method=True)
+        self.AppendEntries = channel.unary_unary(
+                '/distrifs.MasterService/AppendEntries',
+                request_serializer=distrifs__pb2.AppendEntriesRequest.SerializeToString,
+                response_deserializer=distrifs__pb2.AppendEntriesResponse.FromString,
+                _registered_method=True)
 
 
 class MasterServiceServicer(object):
@@ -160,6 +175,25 @@ class MasterServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetChunkLocation(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RequestVote(self, request, context):
+        """Leader election RPCs (Raft-style heartbeats + voting)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AppendEntries(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_MasterServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -217,6 +251,21 @@ def add_MasterServiceServicer_to_server(servicer, server):
                     servicer.GetFilePlan,
                     request_deserializer=distrifs__pb2.GetFilePlanRequest.FromString,
                     response_serializer=distrifs__pb2.GetFilePlanReply.SerializeToString,
+            ),
+            'GetChunkLocation': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetChunkLocation,
+                    request_deserializer=distrifs__pb2.GetChunkLocationRequest.FromString,
+                    response_serializer=distrifs__pb2.GetChunkLocationReply.SerializeToString,
+            ),
+            'RequestVote': grpc.unary_unary_rpc_method_handler(
+                    servicer.RequestVote,
+                    request_deserializer=distrifs__pb2.RequestVoteRequest.FromString,
+                    response_serializer=distrifs__pb2.RequestVoteResponse.SerializeToString,
+            ),
+            'AppendEntries': grpc.unary_unary_rpc_method_handler(
+                    servicer.AppendEntries,
+                    request_deserializer=distrifs__pb2.AppendEntriesRequest.FromString,
+                    response_serializer=distrifs__pb2.AppendEntriesResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -526,6 +575,87 @@ class MasterService(object):
             metadata,
             _registered_method=True)
 
+    @staticmethod
+    def GetChunkLocation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/distrifs.MasterService/GetChunkLocation',
+            distrifs__pb2.GetChunkLocationRequest.SerializeToString,
+            distrifs__pb2.GetChunkLocationReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RequestVote(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/distrifs.MasterService/RequestVote',
+            distrifs__pb2.RequestVoteRequest.SerializeToString,
+            distrifs__pb2.RequestVoteResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AppendEntries(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/distrifs.MasterService/AppendEntries',
+            distrifs__pb2.AppendEntriesRequest.SerializeToString,
+            distrifs__pb2.AppendEntriesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
 
 class DataNodeControlStub(object):
     """Missing associated documentation comment in .proto file."""
@@ -640,4 +770,3 @@ class DataNodeControl(object):
             timeout,
             metadata,
             _registered_method=True)
-
